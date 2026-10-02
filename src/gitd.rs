@@ -1,0 +1,181 @@
+//! Git: every project is a working tree with a repository, committed on a
+//! timer, and served over smart HTTP at `/git/<name>.git` so `git clone`,
+//! `pull` and `push` work with the editor's password.
+//!
+//! Pushes land in the working tree (`receive.denyCurrentBranch=updateInstead`):
+//! before a push is accepted the project is flushed and committed, so the tree
+//! is clean; after it, the live documents are reloaded from disk. The smart
+//! protocol is spoken by spawning `git upload-pack` / `git receive-pack`
+//! with `--stateless-rpc`, which is exactly what `git-http-backend` does.
+
+use std::path::Path;
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+pub const AUTHOR: &str = "kloverleaf <kloverleaf@localhost>";
+
+async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git {}: {}",
+        args.first().unwrap_or(&""),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Makes `dir` a repository if it is not one; idempotent.
+pub async fn init(dir: &Path) -> anyhow::Result<()> {
+    if !dir.join(".git").exists() {
+        git(dir, &["init", "-q", "-b", "main"]).await?;
+    }
+    git(dir, &["config", "receive.denyCurrentBranch", "updateInstead"]).await?;
+    git(dir, &["config", "user.name", "kloverleaf"]).await?;
+    git(dir, &["config", "user.email", "kloverleaf@localhost"]).await?;
+    let ignore = dir.join(".gitignore");
+    let want = ".kloverleaf/\n";
+    match std::fs::read_to_string(&ignore) {
+        Ok(s) if s.lines().any(|l| l.trim() == ".kloverleaf/" || l.trim() == ".kloverleaf") => {}
+        Ok(s) => std::fs::write(&ignore, format!("{}{}{want}", s, if s.ends_with('\n') || s.is_empty() { "" } else { "\n" }))?,
+        Err(_) => std::fs::write(&ignore, want)?,
+    }
+    Ok(())
+}
+
+pub async fn is_dirty(dir: &Path) -> bool {
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Stages everything and commits when something changed; returns the new sha.
+pub async fn commit(dir: &Path, message: &str, author: Option<&str>) -> anyhow::Result<Option<String>> {
+    if !is_dirty(dir).await {
+        return Ok(None);
+    }
+    git(dir, &["add", "-A"]).await?;
+    let author = author
+        .filter(|a| !a.is_empty())
+        .map(|a| format!("{a} <{a}@kloverleaf>"))
+        .unwrap_or_else(|| AUTHOR.to_string());
+    git(dir, &["commit", "-q", "-m", message, "--author", &author]).await?;
+    Ok(Some(head(dir).await?))
+}
+
+pub async fn head(dir: &Path) -> anyhow::Result<String> {
+    Ok(git(dir, &["rev-parse", "HEAD"]).await?.trim().to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct Commit {
+    pub sha: String,
+    pub ts: i64,
+    pub author: String,
+    pub message: String,
+}
+
+pub async fn log(dir: &Path, n: usize) -> anyhow::Result<Vec<Commit>> {
+    let out = git(dir, &["log", &format!("-{n}"), "--format=%H%x1f%at%x1f%an%x1f%s"]).await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split('\x1f');
+            Some(Commit {
+                sha: it.next()?.to_string(),
+                ts: it.next()?.parse().ok()?,
+                author: it.next()?.to_string(),
+                message: it.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect())
+}
+
+// ---- smart HTTP ------------------------------------------------------------------
+
+/// A pkt-line: 4 hex digits of length (including the 4) then the payload.
+pub fn pkt_line(s: &str) -> Vec<u8> {
+    let mut v = format!("{:04x}", s.len() + 4).into_bytes();
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+
+/// `GET info/refs?service=…`: the advertisement, prefixed as the smart protocol requires.
+pub async fn advertise(dir: &Path, service: &str) -> anyhow::Result<Vec<u8>> {
+    let cmd = service.strip_prefix("git-").unwrap_or(service);
+    let out = Command::new("git")
+        .arg(cmd)
+        .arg("--stateless-rpc")
+        .arg("--advertise-refs")
+        .arg(dir)
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr).trim());
+    let mut body = pkt_line(&format!("# service={service}\n"));
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&out.stdout);
+    Ok(body)
+}
+
+/// `POST git-upload-pack` / `git-receive-pack`: the request body goes to the
+/// command's stdin, its stdout is the response.
+pub async fn rpc(dir: &Path, service: &str, body: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let cmd = service.strip_prefix("git-").unwrap_or(service);
+    let mut child = Command::new("git")
+        .arg(cmd)
+        .arg("--stateless-rpc")
+        .arg(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(&body).await;
+        let _ = stdin.shutdown().await;
+    });
+    let out = child.wait_with_output().await?;
+    let _ = writer.await;
+    anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkt_lines() {
+        assert_eq!(pkt_line("# service=git-upload-pack\n"), b"001e# service=git-upload-pack\n".to_vec());
+    }
+
+    #[tokio::test]
+    async fn init_commit_log() {
+        let dir = std::env::temp_dir().join(format!("kl-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).await.unwrap();
+        init(&dir).await.unwrap(); // idempotent
+        assert_eq!(std::fs::read_to_string(dir.join(".gitignore")).unwrap(), ".kloverleaf/\n");
+        std::fs::write(dir.join("main.tex"), "x").unwrap();
+        let sha = commit(&dir, "first", Some("kris")).await.unwrap().unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(commit(&dir, "nothing", None).await.unwrap().is_none());
+        let log = log(&dir, 5).await.unwrap();
+        assert_eq!(log[0].message, "first");
+        assert_eq!(log[0].author, "kris");
+        let adv = advertise(&dir, "git-upload-pack").await.unwrap();
+        assert!(adv.starts_with(b"001e# service=git-upload-pack\n0000"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

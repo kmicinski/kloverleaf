@@ -1,0 +1,27 @@
+[package]
+name = "kloverleaf"
+version = "0.1.0"
+edition = "2024"
+description = "A hosted LaTeX editor: Monaco on the left, the PDF on the right, git underneath, an AI that can read both."
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+flate2 = "1"
+futures-util = "0.3"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+walkdir = "2"
+
+[profile.release]
+debug = 1

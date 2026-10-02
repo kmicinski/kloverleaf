@@ -1,0 +1,24 @@
+# KLOVERLEAF_PASSWORD=… ANTHROPIC_API_KEY=… docker compose up -d --build
+# Put TLS and the public hostname on a reverse proxy in front of 127.0.0.1:7200.
+# Behind Authelia, set KLOVERLEAF_TRUST_REMOTE_USER=1 and let Caddy's
+# forward_auth inject Remote-User; the password then only matters for git
+# over HTTP and for tools (bypass /git/* in the proxy, as with Atlas's /ics/*).
+services:
+  kloverleaf:
+    build: .
+    container_name: kloverleaf
+    ports:
+      - "127.0.0.1:7200:7200"
+    environment:
+      - KLOVERLEAF_PASSWORD=${KLOVERLEAF_PASSWORD:?KLOVERLEAF_PASSWORD is required}
+      - KLOVERLEAF_TRUST_REMOTE_USER=${KLOVERLEAF_TRUST_REMOTE_USER:-0}
+      - KLOVERLEAF_PUBLIC_URL=${KLOVERLEAF_PUBLIC_URL:-http://127.0.0.1:7200}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KLOVERLEAF_AI_MODE=${KLOVERLEAF_AI_MODE:-anthropic}
+      - KLOVERLEAF_AI_MODEL=${KLOVERLEAF_AI_MODEL:-claude-fable-5-1}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - KLOVERLEAF_LOCAL_MODEL=${KLOVERLEAF_LOCAL_MODEL:-qwen3}
+    volumes:
+      # Projects are data: sources, each project's .git, and its .kloverleaf/ history. Must be writable by uid 1000.
+      - ./projects:/app/projects
+    restart: unless-stopped
