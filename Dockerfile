@@ -18,10 +18,14 @@ COPY --from=web /web/dist ./web/dist
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+# The AI is the `claude` CLI (a glibc-linked binary, hence Debian): bind-mount
+# the host's at /usr/local/bin/claude (see docker-compose.yml). git + certs are
+# for the projects and for the CLI, which expects both; openssh-client is for
+# projects that track a repository over ssh (src/upstream.rs).
 # texlive-full is large (~5 GB) but means any package a paper needs is there;
 # swap for texlive-latex-extra + texlive-fonts-recommended + texlive-bibtex-extra + biber to slim down.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      texlive-full latexmk git poppler-utils ca-certificates \
+      texlive-full latexmk git openssh-client poppler-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -u 1000 -m kloverleaf
 WORKDIR /app

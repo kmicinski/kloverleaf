@@ -56,6 +56,11 @@ pub fn numbered(text: &str, from: usize, to: usize) -> String {
     out
 }
 
+/// `n` random bytes as lowercase hex — session ids, invite tokens, the MCP bearer.
+pub fn random_hex(n: usize) -> String {
+    (0..n).map(|_| format!("{:02x}", rand::random::<u8>())).collect()
+}
+
 /// HTML-escapes the five characters that matter in text nodes and attributes.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

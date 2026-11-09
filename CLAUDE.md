@@ -21,6 +21,15 @@ the working notes for changing the code. **Keep both in sync with reality.**
   entry with `meta.restores`. Snapshot policy is inside `Store::record` —
   changing it changes replay cost, not correctness. Project-level notes
   (commits, locks) have `file = ""` and no text.
+- **Branches are a column, not a copy.** Every history entry carries a
+  `branch`; heads and provenance are per branch (`branch_heads`,
+  `branch_provenance`); `Store::lineage_of` turns a branch into
+  `[(branch, upto)]` and `list`/`summary`/`files_at`/`latest_for` filter by
+  it, so an entry id is global and any version is addressable from anywhere.
+  `Project::branch_from` / `switch_branch` settle (flush + commit), move git
+  to a branch of the same name, then `adopt` the snapshot's texts: files the
+  history never recorded (like `.gitignore`) are never removed. The current
+  branch name is remembered in `.kloverleaf/branch`.
 - **`.kloverleaf/` is private and gitignored**; `project::valid_path` refuses
   it and `.git`. Everything else in the project directory is user data.
 - **Builds run in `.kloverleaf/out`** with `-synctex=1`; the PDF is read
@@ -31,18 +40,88 @@ the working notes for changing the code. **Keep both in sync with reality.**
   `.kloverleaf/ai/<session>/` (`tools::make_workspace`); the proposal is the
   diff between that copy's text files and the session's base. Apply goes
   through `replace` with `kind = "ai"` and the prompt in `meta`, then commits.
-- **Dual mode's boundary is `tools::Scope::Metadata`**, enforced in
-  `tools::execute` (text-returning tools are refused, not merely omitted)
-  and in `context_block` (locations only). `delegate` returns structure only.
-  The test `dual_mode_keeps_text_away_from_the_privileged_model` asserts it;
-  keep it passing when adding tools.
-- **Messages are kept in Anthropic's wire shape** (`ai/provider.rs`) and
-  echoed back verbatim, including thinking and server-tool blocks. Ollama
-  converts at the edge. Add providers by adding a `Provider` variant.
-- **Anthropic calls are raw reqwest** (no Rust SDK). Keep
-  `anthropic-version: 2023-06-01`; the `fallbacks: "default"` scalar needs
-  the `server-side-fallback-2026-07-01` header; web tools step down a
-  generation on a 400 that names them (`web_variant`).
+- **The agent is a subprocess, never an HTTP client.** `ai/claude.rs` spawns
+  `claude -p --output-format stream-json` with `--strict-mcp-config` pointing
+  at our own `/mcp` and every built-in file/shell tool disallowed;
+  `ai/codex.rs` spawns `codex exec --json` with a `[mcp_servers.kloverleaf]`
+  entry the app writes into `$CODEX_HOME/config.toml`. Both run through
+  `ai/cli.rs` (spawn, the stdout event loop, the wall clock, stderr for the
+  post-mortem, the retry when a resume is stale); a provider only builds its
+  command and reads its own event shapes. The only way either
+  touches a project is `ai/mcp.rs`, which scopes every call to the session
+  named in the `X-Kloverleaf-Session` header or in the bearer's `:<session>`
+  suffix (codex can only send a bearer). Keep it that way: no `Read`/`Edit`/
+  `Bash` for claude, and cwd at `$HOME` / an empty scratch dir, never the
+  workspace (their own files would otherwise appear in the proposal). The
+  `Catalog` in `ai/mod.rs` is the single source of what may be picked; a
+  session's provider is fixed, its model/effort may change per turn.
+- **Provenance is attributed in blocks.** `provenance::Map::rebase` (every
+  whole-text replacement: AI apply, push, restore, upload, reconnect, branch
+  fork) diffs by line (patience), then by word inside changed lines, then
+  runs the diff-match-patch semantic cleanup (an unchanged run flanked by
+  edits and no longer than either is absorbed) and gives whitespace-only
+  insertions their left neighbour's origin. Never go back to a
+  character-level diff: it matched stray letters across an inserted
+  paragraph and scattered one-letter "AI" islands through the author's
+  prose. Keystrokes (`Map::apply`) are exact and mirrored in
+  `web/src/provenance.ts`; `rebase` is server-only (the browser receives the
+  whole map after a replacement). `history::PROVENANCE_VERSION` stamps the
+  rules into `PRAGMA user_version`: bump it when they change and every map
+  is rebuilt from the log on open (`Store::rebuild_provenance`, which
+  replays each branch's lineage and reuses or re-creates the origins named
+  by `meta.entry`). The test `rebase_attributes_in_blocks_not_letters` is
+  the real failure case.
+- **A login session names the person before the proxy does.** `auth::who`
+  checks the session cookie first, then `Remote-User`: someone who accepted
+  an invite behind Authelia is the guest, not the household account, so
+  their edits carry their own origin. The editor header shows the session
+  (`auth::session`) with a *leave* link; `/logout` returns to `/`.
+- **Scope is enforced in the gates, not the handlers.** `auth::who` yields a
+  `Who { user, projects, creates }` — three shapes via `Who::full` (admin:
+  `projects: None`), `Who::member` (a proxy user not in `KLOVERLEAF_ADMINS`:
+  their `member_projects` rows, recomputed per request, may create) and
+  `Who::guest` (invite login: same rows, may not create). `gate`/`git_gate`
+  refuse any request whose path names a project outside the list
+  (`project_in_path`, which understands nested and un-nested paths) and any
+  creation by someone without `creates`. Handlers that list projects filter
+  by `may`; access management (invites, `POST …/members` shares, removals)
+  requires `Who::manages(project)` = admin or a member *of that project*.
+  `App::create_for` is the only creation path handlers use: it records the
+  creator as a member when they are not an admin, or the project would be
+  invisible to them. A guest's Basic auth is tried before the shared
+  password, so a guest cannot escalate by guessing names; a member's own git
+  password (`members.set_password`) lands them in the same guest-shaped
+  `Who`, which is fine for git.
+- **`/mcp` is loopback-only by construction**: the bearer is random per
+  process and only ever written into the per-run config file (0600, deleted
+  after). It is not an API for outsiders — that is `/api` with the password.
+- **Tool events come from the server, not the transcript.** `mcp.rs` emits
+  the pending/done `tool` pair around each call (it knows the summary); the
+  stream parser only emits `turn` (assistant text), `phase` (what it is doing)
+  and the final result. Adding a tool = `mcp::catalog` + `mcp::execute`.
+- **Resume is best-effort.** The CLI's `session_id` lives on the session; a
+  follow-up passes `--resume`. If that fails (transcript gone), one retry
+  without it, announced in the log.
+- **Conversations persist.** `Session::emit` writes every event into the
+  project's `.kloverleaf/ai/threads.json` (`ThreadStore`); the workspace
+  (`ai/<id>/`) and base texts (`ai/<id>.base.json`) stay on disk until the
+  proposal is applied or discarded, so `Ai::session(project, id)` can rebuild
+  a session after a restart and a follow-up still resumes the CLI. Session
+  ids are per project (the MCP session key is `project:id`). A run the server
+  died in is marked `interrupted` on load. The panel's switcher and
+  `restore()` read `/api/projects/{p}/ai/threads`.
+- **A tracked upstream is three file maps and one commit id.** `upstream.rs`
+  never checks anything out: `base` (the upstream commit the project last
+  agreed with), `ours` (live texts + binary files on disk, through
+  `outgoing`) and `theirs` (origin's head) are read with `ls-tree`/`cat-file`
+  from the bare mirror, merged per file by `merge_all`, and a push is built
+  with plumbing in a private index on top of origin's head. Live texts are
+  only ever written through `Project::replace_if` (compare-and-swap against
+  the `ours` the merge was computed from; on a miss, merge again) — never
+  write a merge result any other way, or a keystroke typed during the merge
+  is lost. Only `local_branch` syncs; the upstream branch is `cfg.branch`, changed by `Mode::Track` (set it, keep `base`, then pull — never reset `base` to the new head, or unpushed work is silently dropped). `Config::pushed` lists our own commits
+  so they never count as a collaborator's activity. Conflict ids hash the
+  conflicting texts; the client sends *all* its picks on every resolve.
 
 ## Gotchas
 
@@ -58,23 +137,32 @@ the working notes for changing the code. **Keep both in sync with reality.**
 - Monarch rules with capture groups must cover every character
   (`(\\begin|\\end)` not `\\(begin|end)`), or Monaco throws while tokenizing.
 - `rusqlite` with `bundled` compiles SQLite from source; the first build is slow.
+- The `claude` binary is glibc-linked (not static): a Debian/Ubuntu image, not
+  Alpine. On the home server it is bind-mounted from the host at
+  `/usr/local/bin/claude`; a running container keeps the old inode after a
+  host upgrade, so recreate it to pick up a new CLI version.
 
 ## Testing
 
-`cargo test` — unit tests next to the code; no test hits a real LLM
-(`Provider::Mock`). Temp dirs come from `history::tmp_dir` (unique per call;
+`cargo test` — unit tests next to the code; no test hits a real LLM — the
+AI tests run a stand-in `claude` shell script that prints stream-json, and
+exercise the MCP tools directly against a workspace. Temp dirs come from `history::tmp_dir` (unique per call;
 two tests in one millisecond once collided on a shared dir). When adding a
-tool to the AI, add it to `tools::definitions` *and* `tools::execute`, decide
-its `Scope`, and extend the dual-mode test if it returns text.
+tool to the AI, add it to `mcp::catalog` *and* `mcp::execute`, and give it a
+one-line summary for the activity log.
 
 ## Deferred (deliberately not in v1)
 
-- Streaming of the model's text; turns are non-streaming with a 20-minute
-  timeout, and progress is the tool log. Add SSE parsing in
-  `provider::Anthropic::chat` if the wait feels long.
+- Token-level streaming of the model's text into the panel; `phase` events
+  and the tool log are the progress today (a 25-minute wall clock bounds a
+  turn). The `stream_event` deltas are already parsed in `claude.rs` if that
+  changes.
 - Per-keystroke presence/cursors of other people; the lock makes a single
   writer, readers see updates live.
-- A client-side web search for `local`/`dual` without Anthropic's server
-  tool (`fetch_url` works; a Brave/SearXNG `web_search` would slot into
-  `tools::definitions(_, network)`).
+- Local/offline models. The old Ollama and dual-LLM providers were removed
+  with the move to CLIs; a third agent CLI is a new `Provider` variant plus a
+  `run()` like `ai/codex.rs`.
 - Renaming files (delete + create), project deletion, bib management UI.
+- Upstream: linking an *existing* project to a repository (only new projects
+  track one), https remotes with tokens, and an "✦ merge with AI" button in
+  the conflict view (the slides app has one to copy).

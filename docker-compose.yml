@@ -1,8 +1,10 @@
-# KLOVERLEAF_PASSWORD=… ANTHROPIC_API_KEY=… docker compose up -d --build
+# KLOVERLEAF_PASSWORD=… CLAUDE_CODE_OAUTH_TOKEN=… docker compose up -d --build
 # Put TLS and the public hostname on a reverse proxy in front of 127.0.0.1:7200.
 # Behind Authelia, set KLOVERLEAF_TRUST_REMOTE_USER=1 and let Caddy's
 # forward_auth inject Remote-User; the password then only matters for git
 # over HTTP and for tools (bypass /git/* in the proxy, as with Atlas's /ics/*).
+# The AI is the `claude` CLI: bind-mount the host's binary (CLAUDE_BIN) and give
+# it a credential (`claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN) and a HOME.
 services:
   kloverleaf:
     build: .
@@ -13,12 +15,21 @@ services:
       - KLOVERLEAF_PASSWORD=${KLOVERLEAF_PASSWORD:?KLOVERLEAF_PASSWORD is required}
       - KLOVERLEAF_TRUST_REMOTE_USER=${KLOVERLEAF_TRUST_REMOTE_USER:-0}
       - KLOVERLEAF_PUBLIC_URL=${KLOVERLEAF_PUBLIC_URL:-http://127.0.0.1:7200}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - KLOVERLEAF_AI_MODE=${KLOVERLEAF_AI_MODE:-anthropic}
-      - KLOVERLEAF_AI_MODEL=${KLOVERLEAF_AI_MODEL:-claude-fable-5-1}
-      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
-      - KLOVERLEAF_LOCAL_MODEL=${KLOVERLEAF_LOCAL_MODEL:-qwen3}
+      - KLOVERLEAF_AI_PROVIDER=${KLOVERLEAF_AI_PROVIDER:-claude}
+      - KLOVERLEAF_AI_MODEL=${KLOVERLEAF_AI_MODEL:-claude-opus-5}
+      - KLOVERLEAF_AI_EFFORT=${KLOVERLEAF_AI_EFFORT:-medium}
+      - HOME=/home/kloverleaf
+      - CODEX_HOME=/home/kloverleaf/.codex
     volumes:
       # Projects are data: sources, each project's .git, and its .kloverleaf/ history. Must be writable by uid 1000.
       - ./projects:/app/projects
+      # The CLI's HOME (transcripts, so follow-ups resume across restarts) and the CLI itself.
+      - ./agent-home:/home/kloverleaf
+      - ${CLAUDE_BIN:-/usr/local/bin/claude}:/usr/local/bin/claude:ro
+      # Optional second agent: the codex binaries and a logged-in auth.json.
+      # - ${CODEX_BIN:-/usr/local/bin/codex}:/usr/local/bin/codex:ro
+      # - ${CODEX_BIN_DIR:-/usr/local/bin}/codex-code-mode-host:/usr/local/bin/codex-code-mode-host:ro
+      # - ~/.codex/auth.json:/home/kloverleaf/.codex/auth.json
     restart: unless-stopped

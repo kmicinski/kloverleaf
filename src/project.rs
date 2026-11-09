@@ -140,7 +140,7 @@ pub fn list_files(dir: &Path) -> Vec<FileInfo> {
     out
 }
 
-fn is_build_byproduct(rel: &str) -> bool {
+pub fn is_build_byproduct(rel: &str) -> bool {
     let ext = rel.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     matches!(
         ext,

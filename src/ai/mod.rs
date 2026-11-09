@@ -5,18 +5,12 @@
 //! goes through the live document like any other change, recorded in the
 //! history with the prompt and model, and committed to git.
 //!
-//! Three modes (`KLOVERLEAF_AI_MODE`):
-//!
-//! - `anthropic` (default when `ANTHROPIC_API_KEY` is set): one frontier
-//!   model sees everything and has every tool, including server-side web
-//!   search and fetch.
-//! - `local`: the same, through Ollama.
-//! - `dual`: the dual-LLM pattern. A *privileged* frontier model plans,
-//!   searches the web and decides, but never receives a line of the document
-//!   — only file names, sizes and error locations. A *quarantined* local
-//!   model does all reading and writing, one `delegate` call at a time, and
-//!   reports back only structurally (which files changed, whether it
-//!   compiles). The boundary is enforced by [`tools::Scope`], not by prompting.
+//! The agent is a headless `claude` (the Claude Code CLI, `claude.rs`), the
+//! way the slides and notes apps on the home server run theirs. Its only
+//! tools are this server's loopback MCP endpoint (`mcp.rs`) — list, read and
+//! search files, exact edits, compile, look at a PDF page, read the PDF's
+//! text — all against the session's workspace, plus Anthropic's server-side
+//! web search and fetch. Follow-ups resume the CLI's own conversation.
 //!
 //! ```text
 //! client → server (inside {"type":"ai", …})
@@ -26,39 +20,240 @@
 //!   {"action":"discard","session"}       throw the proposal away
 //!   {"action":"cancel","session"}        stop a run in progress
 //! server → client ({"type":"ai","session","user","event", …})
-//!   started {prompt}  turn {role,text,model}  tool {role,name,input,summary,error}  
-//!   proposal {text,files:[{path,before,after}],usage}  error {message}  cancelled  applied {files}  discarded
+//!   started {prompt,mode}  phase {text}  turn {role,text,model}  tool {role,name,input,summary,error}
+//!   proposal {text,files:[{path,before,after}],model,usage}  error {message}  cancelled  applied {files}  discarded
 //! ```
 
-pub mod provider;
+pub mod claude;
+pub mod cli;
+pub mod codex;
+pub mod mcp;
 pub mod tools;
 
 use crate::build::{Diagnostic, Severity};
 use crate::live::Project;
 use crate::text;
-use provider::{Provider, Request, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tools::{Scope, Workspace};
+use tools::Workspace;
 
-const MAX_TURNS: usize = 80;
+/// Which CLI runs the turn. Both reach the project only through `/mcp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Claude,
+    Codex,
+}
 
-pub enum Mode {
-    Off(String),
-    Single(Arc<Provider>),
-    Dual { privileged: Arc<Provider>, quarantined: Arc<Provider> },
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+        }
+    }
+}
+
+/// What the author picked for a turn: the agent, its model, how hard it thinks.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Choice {
+    pub provider: Provider,
+    pub model: String,
+    pub effort: String,
+}
+
+/// A request's (partial) choice; missing parts fall back to the defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ChoiceReq {
+    #[serde(default)]
+    pub provider: Option<Provider>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// One installed, logged-in agent CLI and what it may be asked for.
+#[derive(Clone, Debug)]
+pub struct ProviderInfo {
+    pub bin: String,
+    pub models: Vec<String>,
+    pub efforts: Vec<&'static str>,
+    /// Codex's `$CODEX_HOME`; unused for claude.
+    pub home: PathBuf,
+}
+
+/// Everything the picker can offer.
+#[derive(Clone, Debug)]
+pub struct Catalog {
+    pub claude: Result<ProviderInfo, String>,
+    pub codex: Result<ProviderInfo, String>,
+    pub default: Choice,
+}
+
+impl Catalog {
+    pub fn info(&self, p: Provider) -> Result<&ProviderInfo, String> {
+        match p {
+            Provider::Claude => self.claude.as_ref().map_err(|e| e.clone()),
+            Provider::Codex => self.codex.as_ref().map_err(|e| e.clone()),
+        }
+    }
+
+    fn info_mut(&mut self, p: Provider) -> Option<&mut ProviderInfo> {
+        match p {
+            Provider::Claude => self.claude.as_mut().ok(),
+            Provider::Codex => self.codex.as_mut().ok(),
+        }
+    }
+
+    pub fn off_reason(&self) -> Option<String> {
+        match (&self.claude, &self.codex) {
+            (Err(a), Err(b)) => Some(format!("claude: {a}; codex: {b}")),
+            _ => None,
+        }
+    }
+
+    /// Fills in and validates a request against what is installed.
+    pub fn resolve(&self, req: &ChoiceReq) -> anyhow::Result<Choice> {
+        if let Some(r) = self.off_reason() {
+            anyhow::bail!("AI is off: {r}");
+        }
+        let provider = req.provider.unwrap_or(self.default.provider);
+        let info = self.info(provider).map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", provider.label()))?;
+        let model = match &req.model {
+            Some(m) => m.clone(),
+            None if provider == self.default.provider => self.default.model.clone(),
+            None => info.models.first().cloned().unwrap_or_default(),
+        };
+        anyhow::ensure!(model.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)), "bad model id");
+        anyhow::ensure!(info.models.contains(&model), "unknown {} model {model:?}", provider.label());
+        let effort = match &req.effort {
+            Some(e) => e.clone(),
+            None if info.efforts.contains(&self.default.effort.as_str()) => self.default.effort.clone(),
+            None => "medium".into(),
+        };
+        anyhow::ensure!(info.efforts.contains(&effort.as_str()), "unknown effort {effort:?} for {}", provider.label());
+        Ok(Choice { provider, model, effort })
+    }
+}
+
+/// One conversation with the agent, as kept on disk (`.kloverleaf/ai/threads.json`)
+/// so it survives reloads and restarts. The scratch workspace and the base
+/// texts (`.kloverleaf/ai/<id>/`, `<id>.base.json`) live beside it until the
+/// proposal is applied or discarded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Thread {
+    pub id: u64,
+    pub user: String,
+    pub title: String,
+    pub choice: Choice,
+    #[serde(default)]
+    pub agent_session: Option<String>,
+    /// idle · running · applied · discarded · interrupted (server restarted mid-run)
+    pub status: String,
+    pub created: i64,
+    pub updated: i64,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+    #[serde(default)]
+    pub base_heads: BTreeMap<String, i64>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ThreadFile {
+    next: u64,
+    threads: Vec<Thread>,
+}
+
+/// A project's conversations, loaded once, written after every change.
+pub struct ThreadStore {
+    path: PathBuf,
+    file: ThreadFile,
+}
+
+const MAX_THREADS: usize = 40;
+const MAX_MESSAGES: usize = 400;
+
+impl ThreadStore {
+    fn load(project: &Project) -> ThreadStore {
+        let path = ai_dir(project).join("threads.json");
+        let mut file: ThreadFile = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if file.next == 0 {
+            file.next = 1;
+        }
+        // A run the server died in the middle of: say so, instead of "running…" forever.
+        for t in file.threads.iter_mut().filter(|t| t.status == "running") {
+            t.status = "interrupted".into();
+            t.messages.push(json!({"event": "error", "message": "this run was interrupted (the server restarted); ask again to continue"}));
+        }
+        ThreadStore { path, file }
+    }
+
+    fn save(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        if serde_json::to_string(&self.file).ok().and_then(|s| std::fs::write(&tmp, s).ok()).is_some() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+
+    fn thread_mut(&mut self, id: u64) -> Option<&mut Thread> {
+        self.file.threads.iter_mut().find(|t| t.id == id)
+    }
+
+    fn record(&mut self, id: u64, ev: &Value) {
+        let kind = ev["event"].as_str().unwrap_or("");
+        // Live-only chatter is not kept: phases, pending tool rows, drafts.
+        if kind == "phase" || kind == "draft" || (kind == "tool" && ev["summary"] == "…") {
+            return;
+        }
+        if let Some(t) = self.thread_mut(id) {
+            let mut e = ev.clone();
+            if let Some(o) = e.as_object_mut() {
+                o.remove("session");
+                o.remove("user");
+                if kind == "proposal" {
+                    // The diff is recomputed from the workspace on reload; keep only the paths.
+                    let paths: Vec<Value> = o.get("files").and_then(|f| f.as_array()).map(|a| a.iter().map(|f| f["path"].clone()).collect()).unwrap_or_default();
+                    o.insert("files".into(), Value::Array(paths));
+                }
+            }
+            t.messages.push(e);
+            if t.messages.len() > MAX_MESSAGES {
+                let n = t.messages.len() - MAX_MESSAGES;
+                t.messages.drain(..n);
+            }
+            t.updated = crate::history::now_ms();
+            match kind {
+                "started" => t.status = "running".into(),
+                "proposal" | "error" | "cancelled" => t.status = "idle".into(),
+                "applied" => t.status = "applied".into(),
+                "discarded" => t.status = "discarded".into(),
+                _ => {}
+            }
+            self.save();
+        }
+    }
 }
 
 pub struct Ai {
-    pub mode: Mode,
-    pub http: reqwest::Client,
-    sessions: Mutex<HashMap<u64, Arc<Session>>>,
-    next: AtomicU64,
+    pub catalog: Catalog,
+    sessions: Mutex<HashMap<(String, u64), Arc<Session>>>,
+    threads: Mutex<HashMap<String, Arc<Mutex<ThreadStore>>>>,
+    /// Projects seen, by name — to rebuild a session from disk.
+    projects: Mutex<HashMap<String, Project>>,
     latex_timeout: Duration,
+    /// Bearer for `/mcp`; random per process, known only to the CLIs we spawn.
+    pub mcp_token: String,
+    /// The port this server listens on, for the loopback MCP URL.
+    pub mcp_port: u16,
 }
 
 pub struct Session {
@@ -68,11 +263,75 @@ pub struct Session {
     pub prompt: String,
     pub ws: Workspace,
     base: BTreeMap<String, String>,
-    messages: Mutex<Vec<Value>>,
-    cancel: AtomicBool,
+    /// Each file's history head when the session began: the version the prompt addressed.
+    base_heads: BTreeMap<String, i64>,
+    /// The project's conversation log, where every event of this session is kept.
+    log: Arc<Mutex<ThreadStore>>,
+    /// The agent for this conversation (the provider is fixed; model/effort may change per turn).
+    pub choice: Mutex<Choice>,
+    /// The CLI's own session/thread id, resumed on follow-ups.
+    pub agent_session: Mutex<Option<String>>,
+    /// The CLI process while a turn runs, so cancel can kill it.
+    pub child: Mutex<Option<tokio::process::Child>>,
+    pub cancel: AtomicBool,
     busy: AtomicBool,
     task: Mutex<Option<tokio::task::AbortHandle>>,
     model: Mutex<String>,
+}
+
+impl Session {
+    /// A session over an existing workspace: fresh (`new_session`) or brought
+    /// back from the project's thread log after a restart (`Ai::session`).
+    #[allow(clippy::too_many_arguments)]
+    fn new(id: u64, project: Project, thread: &Thread, ws: Workspace, base: BTreeMap<String, String>, log: Arc<Mutex<ThreadStore>>) -> Session {
+        Session {
+            id,
+            project,
+            user: thread.user.clone(),
+            prompt: thread.title.clone(),
+            ws,
+            base,
+            base_heads: thread.base_heads.clone(),
+            log,
+            choice: Mutex::new(thread.choice.clone()),
+            agent_session: Mutex::new(thread.agent_session.clone()),
+            child: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            task: Mutex::new(None),
+            model: Mutex::new(thread.choice.model.clone()),
+        }
+    }
+
+    /// An AI event about this session: to every open editor of the project, and into the log.
+    pub fn emit(&self, mut ev: Value) {
+        ev["session"] = json!(self.id);
+        ev["user"] = json!(self.user);
+        self.log.lock().unwrap().record(self.id, &ev);
+        if let Some(sid) = self.agent_session.lock().unwrap().clone()
+            && let Some(t) = self.log.lock().unwrap().thread_mut(self.id)
+            && t.agent_session.as_deref() != Some(sid.as_str())
+        {
+            t.agent_session = Some(sid);
+        }
+        self.project.emit_ai(ev);
+    }
+
+    /// `project:id`, how the MCP endpoint is told which workspace a call is for.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.project.name, self.id)
+    }
+
+    fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(t) = self.task.lock().unwrap().take() {
+            t.abort();
+        }
+        if let Some(c) = self.child.lock().unwrap().as_mut() {
+            let _ = c.start_kill();
+        }
+        self.busy.store(false, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -132,119 +391,261 @@ pub struct Outcome {
     pub output_tokens: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Single,
-    Privileged,
-    Quarantined,
+/// Where a project's sessions live: the thread log, each workspace, each base.
+fn ai_dir(project: &Project) -> PathBuf {
+    project.dir.join(crate::project::PRIVATE_DIR).join("ai")
 }
 
-impl Role {
-    fn name(self) -> &'static str {
-        match self {
-            Role::Single => "assistant",
-            Role::Privileged => "coordinator",
-            Role::Quarantined => "local",
-        }
-    }
+/// The texts a session started from, kept until it is applied or discarded.
+fn base_file(project: &Project, id: u64) -> PathBuf {
+    ai_dir(project).join(format!("{id}.base.json"))
+}
+
+fn list(env: Option<String>, default: &str) -> Vec<String> {
+    env.as_deref().unwrap_or(default).split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
 impl Ai {
-    pub fn from_env(latex_timeout: Duration) -> Ai {
+    /// `KLOVERLEAF_AI_MODE=off` disables everything. Otherwise each CLI is
+    /// offered if it is installed and logged in: claude (`KLOVERLEAF_CLAUDE_BIN`,
+    /// `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) and codex
+    /// (`KLOVERLEAF_CODEX_BIN`, `$CODEX_HOME/auth.json`). Model lists come from
+    /// `KLOVERLEAF_CLAUDE_MODELS` / `KLOVERLEAF_CODEX_MODELS`; the default pick
+    /// from `KLOVERLEAF_AI_PROVIDER`, `KLOVERLEAF_AI_MODEL`, `KLOVERLEAF_AI_EFFORT`.
+    pub fn from_env(latex_timeout: Duration, bind: &str) -> Ai {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let key = env("ANTHROPIC_API_KEY");
-        let anthropic = || {
-            key.clone().map(|k| {
-                Arc::new(Provider::Anthropic(provider::Anthropic::new(
-                    k,
-                    env("KLOVERLEAF_AI_MODEL").unwrap_or_else(|| "claude-fable-5-1".into()),
-                    env("KLOVERLEAF_AI_EFFORT").unwrap_or_else(|| "high".into()),
-                )))
-            })
-        };
-        let ollama = || {
-            Arc::new(Provider::Ollama(provider::Ollama::new(
-                env("OLLAMA_URL").unwrap_or_else(|| "http://127.0.0.1:11434".into()),
-                env("KLOVERLEAF_LOCAL_MODEL").unwrap_or_else(|| "qwen3".into()),
-            )))
-        };
-        let mode = match env("KLOVERLEAF_AI_MODE").as_deref().unwrap_or("anthropic") {
-            "off" => Mode::Off("KLOVERLEAF_AI_MODE=off".into()),
-            "local" => Mode::Single(ollama()),
-            "dual" => match anthropic() {
-                Some(p) => Mode::Dual { privileged: p, quarantined: ollama() },
-                None => Mode::Off("dual mode needs ANTHROPIC_API_KEY for the privileged model".into()),
-            },
-            _ => match anthropic() {
-                Some(p) => Mode::Single(p),
-                None => Mode::Off("set ANTHROPIC_API_KEY (or KLOVERLEAF_AI_MODE=local with Ollama)".into()),
-            },
-        };
-        Ai::new(mode, latex_timeout)
-    }
+        let off = env("KLOVERLEAF_AI_MODE").as_deref() == Some("off");
+        let port = bind.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(7200);
 
-    pub fn new(mode: Mode, latex_timeout: Duration) -> Ai {
-        Ai {
-            mode,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(60)).build().expect("reqwest"),
-            sessions: Mutex::new(HashMap::new()),
-            next: AtomicU64::new(1),
-            latex_timeout,
+        let claude_bin = env("KLOVERLEAF_CLAUDE_BIN").unwrap_or_else(|| "claude".into());
+        let claude = if off {
+            Err("KLOVERLEAF_AI_MODE=off".to_string())
+        } else if cli::find(&claude_bin).is_none() {
+            Err(format!("the `{claude_bin}` CLI is not installed"))
+        } else if env("CLAUDE_CODE_OAUTH_TOKEN").is_none() && env("ANTHROPIC_API_KEY").is_none() {
+            Err("no credentials: set CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) or ANTHROPIC_API_KEY".to_string())
+        } else {
+            Ok(ProviderInfo { bin: claude_bin, models: list(env("KLOVERLEAF_CLAUDE_MODELS"), claude::DEFAULT_MODELS), efforts: claude::EFFORTS.to_vec(), home: PathBuf::new() })
+        };
+
+        let codex_bin = env("KLOVERLEAF_CODEX_BIN").unwrap_or_else(|| "codex".into());
+        let home = codex::home();
+        let codex = if off {
+            Err("KLOVERLEAF_AI_MODE=off".to_string())
+        } else if cli::find(&codex_bin).is_none() {
+            Err(format!("the `{codex_bin}` CLI is not installed"))
+        } else if let Err(e) = codex::available(&home) {
+            Err(e)
+        } else if let Err(e) = codex::write_config(&home, port) {
+            Err(format!("could not write {}: {e}", home.join("config.toml").display()))
+        } else {
+            Ok(ProviderInfo { bin: codex_bin, models: list(env("KLOVERLEAF_CODEX_MODELS"), codex::DEFAULT_MODELS), efforts: codex::EFFORTS.to_vec(), home })
+        };
+
+        let mut default = Choice {
+            provider: match env("KLOVERLEAF_AI_PROVIDER").as_deref() {
+                Some("codex") => Provider::Codex,
+                _ => Provider::Claude,
+            },
+            model: env("KLOVERLEAF_AI_MODEL").unwrap_or_else(|| claude::DEFAULT_MODEL.into()),
+            effort: env("KLOVERLEAF_AI_EFFORT").unwrap_or_else(|| claude::DEFAULT_EFFORT.into()),
+        };
+        let mut catalog = Catalog { claude, codex, default: default.clone() };
+        // Fall back to whichever agent is actually there, and make sure the
+        // configured default model is on offer (an operator may name a model
+        // the list does not know yet).
+        if catalog.info(default.provider).is_err() {
+            default.provider = if catalog.claude.is_ok() { Provider::Claude } else { Provider::Codex };
+            default.model = catalog.info(default.provider).ok().and_then(|i| i.models.first().cloned()).unwrap_or_default();
         }
-    }
-
-    pub fn describe(&self) -> Value {
-        match &self.mode {
-            Mode::Off(reason) => json!({"mode": "off", "reason": reason}),
-            Mode::Single(p) => json!({"mode": if matches!(**p, Provider::Ollama(_)) { "local" } else { "anthropic" }, "model": p.label()}),
-            Mode::Dual { privileged, quarantined } => {
-                json!({"mode": "dual", "model": privileged.label(), "local": quarantined.label()})
+        if let Some(i) = catalog.info_mut(default.provider) {
+            if !i.models.contains(&default.model) {
+                i.models.insert(0, default.model.clone());
+            }
+            if !i.efforts.contains(&default.effort.as_str()) {
+                default.effort = "medium".into();
             }
         }
+        catalog.default = default;
+        Ai::new(catalog, latex_timeout, port)
     }
 
-    pub fn session(&self, id: u64) -> Option<Arc<Session>> {
-        self.sessions.lock().unwrap().get(&id).cloned()
+    pub fn new(catalog: Catalog, latex_timeout: Duration, mcp_port: u16) -> Ai {
+        Ai {
+            catalog,
+            sessions: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            latex_timeout,
+            mcp_token: text::random_hex(32),
+            mcp_port,
+        }
     }
 
-    /// Starts a session: a scratch copy of the project as it is right now.
-    pub fn new_session(&self, project: Project, user: &str, prompt: &str) -> anyhow::Result<Arc<Session>> {
-        if let Mode::Off(reason) = &self.mode {
+    /// What the picker shows: the agents on offer, their models and efforts, the default.
+    pub fn describe(&self) -> Value {
+        let c = &self.catalog;
+        if let Some(reason) = c.off_reason() {
+            return json!({"mode": "off", "reason": reason});
+        }
+        let mut providers = Vec::new();
+        let mut unavailable = serde_json::Map::new();
+        for p in [Provider::Claude, Provider::Codex] {
+            match c.info(p) {
+                Ok(i) => providers.push(json!({"id": p, "label": p.label(), "models": i.models, "efforts": i.efforts})),
+                Err(e) => {
+                    unavailable.insert(p.label().to_lowercase(), json!(e));
+                }
+            }
+        }
+        json!({"mode": "on", "default": c.default, "providers": providers, "unavailable": unavailable,
+               // kept for older clients / logs
+               "model": c.default.model, "effort": c.default.effort})
+    }
+
+    /// Registers a project (so sessions can be rebuilt from disk) and loads
+    /// its conversations; interrupted runs are marked on load.
+    pub fn remember(&self, project: &Project) {
+        self.projects.lock().unwrap().insert(project.name.clone(), project.clone());
+        let _ = self.log_for(project);
+    }
+
+    /// The project's conversation log (loaded on first use).
+    pub fn log_for(&self, project: &Project) -> Arc<Mutex<ThreadStore>> {
+        let mut map = self.threads.lock().unwrap();
+        map.entry(project.name.clone()).or_insert_with(|| Arc::new(Mutex::new(ThreadStore::load(project)))).clone()
+    }
+
+    /// The conversations of a project, newest first, without their messages.
+    pub fn threads(&self, project: &Project) -> Vec<Value> {
+        let log = self.log_for(project);
+        let g = log.lock().unwrap();
+        let mut out: Vec<Value> = g
+            .file
+            .threads
+            .iter()
+            .map(|t| json!({"id": t.id, "title": t.title, "user": t.user, "status": t.status, "choice": t.choice, "created": t.created, "updated": t.updated, "messages": t.messages.len()}))
+            .collect();
+        out.reverse();
+        out
+    }
+
+    /// One conversation with its messages, plus the live proposal if its workspace is still there.
+    pub fn thread(&self, project: &Project, id: u64) -> Option<Value> {
+        let log = self.log_for(project);
+        let t = log.lock().unwrap().file.threads.iter().find(|t| t.id == id).cloned()?;
+        let proposal = self.session(&project.name, id).map(|s| self.proposal(&s));
+        Some(json!({"thread": t, "proposal": proposal}))
+    }
+
+    /// A live session, or one brought back from disk (its workspace and base
+    /// are still there until it is applied or discarded).
+    pub fn session(&self, project: &str, id: u64) -> Option<Arc<Session>> {
+        if let Some(s) = self.sessions.lock().unwrap().get(&(project.to_string(), id)) {
+            return Some(s.clone());
+        }
+        let p = self.projects.lock().unwrap().get(project)?.clone();
+        let log = self.log_for(&p);
+        let t = log.lock().unwrap().file.threads.iter().find(|t| t.id == id && (t.status == "idle" || t.status == "interrupted"))?.clone();
+        let dir = ai_dir(&p).join(id.to_string());
+        if !dir.is_dir() {
+            return None;
+        }
+        let base: BTreeMap<String, String> = std::fs::read_to_string(base_file(&p, id)).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        let ws = Workspace { dir, latex_timeout: self.latex_timeout };
+        let s = Arc::new(Session::new(id, p, &t, ws, base, log));
+        self.sessions.lock().unwrap().insert((project.to_string(), id), s.clone());
+        Some(s)
+    }
+
+    /// Starts a session: a scratch copy of the project as it is right now, for one agent.
+    pub fn new_session(&self, project: Project, user: &str, prompt: &str, choice: Choice) -> anyhow::Result<Arc<Session>> {
+        if let Some(reason) = self.catalog.off_reason() {
             anyhow::bail!("AI is off: {reason}");
         }
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.remember(&project);
+        let log = self.log_for(&project);
+        let id = {
+            let mut g = log.lock().unwrap();
+            let id = g.file.next;
+            g.file.next += 1;
+            id
+        };
         let base = project.texts();
-        let dir = project.dir.join(crate::project::PRIVATE_DIR).join("ai").join(id.to_string());
-        let ws = tools::make_workspace(&dir, &project.dir, &base, self.latex_timeout)?;
-        let s = Arc::new(Session {
+        let base_heads: BTreeMap<String, i64> = base.keys().filter_map(|f| project.history.head(f).map(|h| (f.clone(), h))).collect();
+        let ws = tools::make_workspace(&ai_dir(&project).join(id.to_string()), &project.dir, &base, self.latex_timeout)?;
+        std::fs::write(base_file(&project, id), serde_json::to_string(&base)?)?;
+        let now = crate::history::now_ms();
+        let thread = Thread {
             id,
-            project,
             user: user.into(),
-            prompt: prompt.into(),
-            ws,
-            base,
-            messages: Mutex::new(Vec::new()),
-            cancel: AtomicBool::new(false),
-            busy: AtomicBool::new(false),
-            task: Mutex::new(None),
-            model: Mutex::new(String::new()),
-        });
-        self.sessions.lock().unwrap().insert(id, s.clone());
+            title: prompt.chars().take(120).collect(),
+            choice,
+            agent_session: None,
+            status: "idle".into(),
+            created: now,
+            updated: now,
+            messages: vec![],
+            base_heads,
+        };
+        {
+            let mut g = log.lock().unwrap();
+            g.file.threads.push(thread.clone());
+            // Old finished conversations fall off the end.
+            while g.file.threads.len() > MAX_THREADS {
+                if let Some(i) = g.file.threads.iter().position(|t| t.status == "applied" || t.status == "discarded") {
+                    g.file.threads.remove(i);
+                } else {
+                    break;
+                }
+            }
+            g.save();
+        }
+        let name = project.name.clone();
+        let s = Arc::new(Session { prompt: prompt.into(), model: Mutex::new(String::new()), ..Session::new(id, project, &thread, ws, base, log) });
+        self.sessions.lock().unwrap().insert((name, id), s.clone());
         Ok(s)
     }
 
-    pub fn end_session(&self, id: u64) {
-        if let Some(s) = self.sessions.lock().unwrap().remove(&id) {
-            s.cancel.store(true, Ordering::Relaxed);
-            if let Some(t) = s.task.lock().unwrap().take() {
-                t.abort();
-            }
+    pub fn end_session(&self, project: &str, id: u64) {
+        if let Some(s) = self.sessions.lock().unwrap().remove(&(project.to_string(), id)) {
+            s.stop();
             let _ = std::fs::remove_dir_all(&s.ws.dir);
+            let _ = std::fs::remove_file(base_file(&s.project, id));
         }
     }
 
+    /// Throws a proposal away: tells the editors (if the session is known) and
+    /// removes its workspace. Returns whether there was a session to tell.
+    pub fn discard(&self, project: &str, id: u64) -> bool {
+        let known = self.session(project, id).map(|s| s.emit(json!({"event": "discarded"}))).is_some();
+        self.end_session(project, id);
+        known
+    }
+
+    /// One turn with its events — `started`, then `proposal` or `error` — so
+    /// the socket panel and the synchronous API tell the same story.
+    pub async fn turn(&self, s: &Session, prompt: &str, ctx: &Context, choice: Choice) -> anyhow::Result<Outcome> {
+        s.emit(json!({"event": "started", "prompt": prompt, "mode": self.describe(), "choice": choice}));
+        let result = self.run(s, prompt, ctx, Some(choice)).await;
+        match &result {
+            Ok(o) => s.emit(json!({"event": "proposal", "text": o.text, "files": o.files, "model": o.model,
+                                   "usage": {"input": o.input_tokens, "output": o.output_tokens}})),
+            Err(e) => s.emit(json!({"event": "error", "message": format!("{e:#}")})),
+        }
+        result
+    }
+
     /// One user turn: the first prompt or a follow-up on the same scratch copy.
-    pub async fn run(&self, s: &Session, prompt: &str, ctx: &Context) -> anyhow::Result<Outcome> {
+    /// A new `choice` may change the model or effort, not the agent.
+    pub async fn run(&self, s: &Session, prompt: &str, ctx: &Context, choice: Option<Choice>) -> anyhow::Result<Outcome> {
+        if let Some(c) = choice {
+            let mut cur = s.choice.lock().unwrap();
+            if c.provider != cur.provider {
+                anyhow::bail!("switching between {} and {} starts a new conversation — apply or discard this proposal first", cur.provider.label(), c.provider.label());
+            }
+            *cur = c;
+        }
         if s.busy.swap(true, Ordering::Relaxed) {
             anyhow::bail!("this session is already running");
         }
@@ -255,18 +656,23 @@ impl Ai {
     }
 
     async fn run_inner(&self, s: &Session, prompt: &str, ctx: &Context) -> anyhow::Result<Outcome> {
-        let (role, provider) = match &self.mode {
-            Mode::Off(r) => anyhow::bail!("AI is off: {r}"),
-            Mode::Single(p) => (Role::Single, p.clone()),
-            Mode::Dual { privileged, .. } => (Role::Privileged, privileged.clone()),
-        };
-        let scope = if role == Role::Privileged { Scope::Metadata } else { Scope::Full };
+        let choice = s.choice.lock().unwrap().clone();
+        let info = self.catalog.info(choice.provider).map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", choice.provider.label()))?.clone();
         let diags = s.project.latest().map(|b| b.diagnostics.clone()).unwrap_or_default();
-        let user_msg = format!("{}\n\n## Request\n\n{}", context_block(ctx, scope, &s.ws, &diags), prompt);
-        let mut messages = s.messages.lock().unwrap().clone();
-        messages.push(json!({"role": "user", "content": [{"type": "text", "text": user_msg}]}));
-        let (text, model, input_tokens, output_tokens) = self.run_loop(s, role, &provider, &mut messages, ctx).await?;
-        *s.messages.lock().unwrap() = messages;
+        let story = s.project.history.story(8);
+        let message = format!("{}\n## Where this draft has been\n\n{story}\n## Request\n\n{}", context_block(ctx, &s.ws, &diags), prompt);
+        let (text, model, input_tokens, output_tokens) = match choice.provider {
+            Provider::Claude => {
+                let r = claude::Runner { bin: info.bin, model: choice.model, effort: choice.effort };
+                let t = claude::run(&r, s, &message, SYSTEM, self.mcp_port, &self.mcp_token).await?;
+                (t.text, t.model, t.input_tokens, t.output_tokens)
+            }
+            Provider::Codex => {
+                let r = codex::Runner { bin: info.bin, model: choice.model, effort: choice.effort, home: info.home };
+                let t = codex::run(&r, s, &message, SYSTEM, &self.mcp_token).await?;
+                (t.text, t.model, t.input_tokens, t.output_tokens)
+            }
+        };
         *s.model.lock().unwrap() = model.clone();
         Ok(Outcome { session: s.id, text, files: self.proposal(s), model, input_tokens, output_tokens })
     }
@@ -283,136 +689,16 @@ impl Ai {
         out
     }
 
-    async fn run_loop(
-        &self,
-        s: &Session,
-        role: Role,
-        provider: &Provider,
-        messages: &mut Vec<Value>,
-        ctx: &Context,
-    ) -> anyhow::Result<(String, String, u64, u64)> {
-        let (scope, web, network, system) = match role {
-            Role::Single => (Scope::Full, true, true, SYSTEM_SINGLE),
-            Role::Privileged => (Scope::Metadata, true, true, SYSTEM_PRIVILEGED),
-            Role::Quarantined => (Scope::Full, false, false, SYSTEM_QUARANTINED),
-        };
-        let mut tool_defs = tools::definitions(scope, network);
-        if role == Role::Privileged {
-            tool_defs.push(delegate_tool());
-        }
-        let emit = |v: Value| {
-            let mut v = v;
-            v["session"] = json!(s.id);
-            v["user"] = json!(s.user);
-            s.project.emit_ai(v);
-        };
-        let (mut in_tok, mut out_tok) = (0u64, 0u64);
-        let mut model;
-        for _ in 0..MAX_TURNS {
-            anyhow::ensure!(!s.cancel.load(Ordering::Relaxed), "cancelled");
-            let turn = provider
-                .chat(Request { system, tools: &tool_defs, messages, web })
-                .await?;
-            in_tok += turn.input_tokens;
-            out_tok += turn.output_tokens;
-            model = turn.model.clone();
-            let text = turn.text();
-            if !text.trim().is_empty() {
-                emit(json!({"event": "turn", "role": role.name(), "text": text, "model": turn.model}));
-            }
-            messages.push(json!({"role": "assistant", "content": turn.content}));
-            match turn.stop_reason.as_str() {
-                "tool_use" => {
-                    let mut results = Vec::new();
-                    for (id, name, input) in turn.tool_uses() {
-                        anyhow::ensure!(!s.cancel.load(Ordering::Relaxed), "cancelled");
-                        emit(json!({"event": "tool", "role": role.name(), "name": name, "input": brief(&input), "summary": "…"}));
-                        let out = if name == "delegate" && role == Role::Privileged {
-                            self.delegate(s, &input, ctx).await
-                        } else {
-                            tools::execute(&s.ws, scope, &name, &input, &self.http).await
-                        };
-                        emit(json!({"event": "tool", "role": role.name(), "name": name, "input": brief(&input), "summary": out.summary, "error": out.is_error}));
-                        results.push(json!({"type": "tool_result", "tool_use_id": id, "content": out.content, "is_error": out.is_error}));
-                    }
-                    messages.push(json!({"role": "user", "content": results}));
-                }
-                "pause_turn" => continue,
-                "max_tokens" => {
-                    messages.push(json!({"role": "user", "content": [{"type": "text", "text": "You stopped at the output limit. Continue from where you left off."}]}));
-                }
-                _ => return Ok((text, model, in_tok, out_tok)),
-            }
-        }
-        anyhow::bail!("stopped after {MAX_TURNS} turns without finishing")
-    }
-
-    /// Dual mode: the privileged model's one way to touch the text. A fresh
-    /// quarantined conversation per call; what comes back is structural.
-    async fn delegate(&self, s: &Session, input: &Value, ctx: &Context) -> tools::Output {
-        let Mode::Dual { quarantined, .. } = &self.mode else {
-            return tools::Output { content: vec![json!({"type": "text", "text": "not in dual mode"})], is_error: true, summary: "delegate unavailable".into() };
-        };
-        let task = input["task"].as_str().unwrap_or("").trim().to_string();
-        if task.is_empty() {
-            return tools::Output { content: vec![json!({"type": "text", "text": "task is required"})], is_error: true, summary: "delegate: no task".into() };
-        }
-        let before = s.ws.texts();
-        let diags = s.ws.compiled.lock().unwrap().clone().unwrap_or_default();
-        let user_msg = format!(
-            "{}\n\n## The author's original request\n\n{}\n\n## Your task from the coordinator\n\n{}",
-            context_block(ctx, Scope::Full, &s.ws, &diags),
-            s.prompt,
-            task
-        );
-        let mut messages = vec![json!({"role": "user", "content": [{"type": "text", "text": user_msg}]})];
-        let result = Box::pin(self.run_loop(s, Role::Quarantined, quarantined, &mut messages, ctx)).await;
-        let after = s.ws.texts();
-        let mut changed = Vec::new();
-        for (path, text) in &after {
-            let old = before.get(path).map(String::as_str).unwrap_or("");
-            if old != text {
-                changed.push(json!({
-                    "path": path,
-                    "lines_before": old.lines().count(),
-                    "lines_after": text.lines().count(),
-                    "new": !before.contains_key(path),
-                }));
-            }
-        }
-        let compiled = s.ws.compiled.lock().unwrap().clone().map(|d| {
-            json!({
-                "errors": d.iter().filter(|x| x.severity == Severity::Error).count(),
-                "warnings": d.iter().filter(|x| x.severity == Severity::Warning).count(),
-            })
-        });
-        match result {
-            Ok(_) => {
-                let n = changed.len();
-                let body = json!({
-                    "status": "finished",
-                    "files_changed": changed,
-                    "last_compile": compiled,
-                    "note": "The local assistant's words are not shown to you by design; only this structural summary is.",
-                });
-                tools::Output { content: vec![json!({"type": "text", "text": body.to_string()})], is_error: false, summary: format!("delegated: {n} file(s) changed") }
-            }
-            Err(e) => tools::Output {
-                content: vec![json!({"type": "text", "text": format!("the local assistant failed: {e:#}")})],
-                is_error: true,
-                summary: format!("delegate failed: {e:#}"),
-            },
-        }
-    }
-
     /// Applies (possibly hand-edited) proposed files to the live project, commits, ends the session.
     pub async fn apply(&self, s: &Session, files: Vec<(String, String)>) -> anyhow::Result<Vec<String>> {
         anyhow::ensure!(s.project.take_lock(&s.user, false), "someone else holds the edit lock");
         let model = s.model.lock().unwrap().clone();
-        let meta = json!({"session": s.id, "prompt": s.prompt, "model": model});
         let mut applied = Vec::new();
         for (path, text) in files {
-            s.project.replace(&path, text, 0, &s.user, "ai", meta.clone())?;
+            // `base` is the entry this file was at when the AI read it — what
+            // the prompt addressed; provenance hovers can travel back to it.
+            let meta = json!({"session": s.id, "prompt": s.prompt, "model": model, "base": s.base_heads.get(&path)});
+            s.project.replace(&path, text, 0, &s.user, "ai", meta)?;
             applied.push(path);
         }
         s.project.flush();
@@ -421,26 +707,13 @@ impl Ai {
         if let Ok(Some(sha)) = crate::gitd::commit(&s.project.dir, &message, Some(&s.user)).await {
             s.project.committed(&sha, &message, &s.user).await;
         }
-        self.end_session(s.id);
+        self.end_session(&s.project.name, s.id);
         Ok(applied)
     }
 }
 
-fn delegate_tool() -> Tool {
-    Tool {
-        name: "delegate",
-        description: "Hand a task to the local assistant, which can read and edit the document's text, compile it and look at the PDF — things you cannot do. Describe the task fully in plain language (what to change, where, in what style, what you found on the web); it also sees the author's request and context. You get back only which files changed and whether the project compiles.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {"task": {"type": "string"}},
-            "required": ["task"],
-            "additionalProperties": false
-        }),
-    }
-}
-
 /// A short rendering of a tool's input for the activity log (no file contents).
-fn brief(input: &Value) -> Value {
+pub(crate) fn brief(input: &Value) -> Value {
     let mut v = json!({});
     if let Some(o) = input.as_object() {
         for (k, val) in o {
@@ -454,9 +727,8 @@ fn brief(input: &Value) -> Value {
     v
 }
 
-/// What the model is told about where the author is. In `Metadata` scope,
-/// locations only; in `Full` scope, the text too, and the current file when small.
-fn context_block(ctx: &Context, scope: Scope, ws: &Workspace, diags: &[Diagnostic]) -> String {
+/// What the model is told about where the author is, and the current file when small.
+fn context_block(ctx: &Context, ws: &Workspace, diags: &[Diagnostic]) -> String {
     let mut s = String::from("## Where the author is\n\n");
     let main = ws.main();
     let files: Vec<String> = ws
@@ -470,10 +742,7 @@ fn context_block(ctx: &Context, scope: Scope, ws: &Workspace, diags: &[Diagnosti
     }
     let region = |r: &Region, label: &str| -> String {
         let head = format!("{label}: {} lines {}-{}{}", r.file, r.from, r.to, r.note.as_ref().map(|n| format!(" — note: {n}")).unwrap_or_default());
-        match scope {
-            Scope::Full if !r.text.is_empty() => format!("{head}\n```\n{}\n```\n", r.text),
-            _ => format!("{head}\n"),
-        }
+        if r.text.is_empty() { format!("{head}\n") } else { format!("{head}\n```\n{}\n```\n", r.text) }
     };
     if let Some(sel) = &ctx.selection {
         s.push_str(&region(sel, "Selection"));
@@ -503,14 +772,10 @@ fn context_block(ctx: &Context, scope: Scope, ws: &Workspace, diags: &[Diagnosti
     } else {
         s.push_str(&format!("Last compile: {} error(s), {warnings} warning(s)\n", errors.len()));
         for d in errors.iter().take(10) {
-            match scope {
-                Scope::Full => s.push_str(&format!("  - {}:{}: {}\n", d.file, d.line.unwrap_or(0), d.message)),
-                Scope::Metadata => s.push_str(&format!("  - {}:{}\n", d.file, d.line.unwrap_or(0))),
-            }
+            s.push_str(&format!("  - {}:{}: {}\n", d.file, d.line.unwrap_or(0), d.message));
         }
     }
-    if scope == Scope::Full
-        && let Some(file) = &ctx.file
+    if let Some(file) = &ctx.file
         && let Ok(text) = ws.read(file)
         && text.len() <= 60_000
     {
@@ -519,17 +784,11 @@ fn context_block(ctx: &Context, scope: Scope, ws: &Workspace, diags: &[Diagnosti
     s
 }
 
-const SYSTEM_SINGLE: &str = "You are the writing assistant inside kloverleaf, a LaTeX editor. The author is working on the document in front of them and has asked you for something; the message tells you where they are (cursor, selection, regions they queued for you, the last place they clicked in the PDF) and how the last compile went.
+const SYSTEM: &str = "You are the writing assistant inside kloverleaf, a LaTeX editor. The author is working on the document in front of them and has asked you for something; the message tells you where they are (cursor, selection, regions they queued for you, the last place they clicked in the PDF) and how the last compile went.
 
-You work on a scratch copy of the project. Read what you need, make the edits with write_edits (exact, unique `old` strings — read first, then copy exactly), compile to check, and look at the PDF page when layout, figures or math matter. The author will review your changes as a diff before anything is applied, so be decisive: do the work rather than describing it. Keep the author's voice, macros and conventions; change what was asked and what is clearly needed to make it work, not more. Use the web when you need a citation, a package's syntax, or a fact. If the request is ambiguous in a way that matters, pick the reasonable reading and say what you assumed.
+You work on a scratch copy of the project through the kloverleaf tools — they are the only way to see or change it. Read what you need (read_file, search_files), make the edits with write_edits (exact, unique `old` strings — read first, then copy exactly), compile to check, and view_pdf_page when layout, figures or math matter. The author will review your changes as a diff before anything is applied, so be decisive: do the work rather than describing it or asking permission. Keep the author's voice, macros and conventions; change what was asked and what is clearly needed to make it work, not more. Use web search when you need a citation, a package's syntax, or a fact. If the request is ambiguous in a way that matters, pick the reasonable reading and say what you assumed.
 
-When you are done, reply briefly: what you changed and why, anything you could not do, and anything the author should check.";
-
-const SYSTEM_PRIVILEGED: &str = "You are the coordinator inside kloverleaf, a LaTeX editor, working in dual-LLM mode: the document is private and you never see its text — only file names, sizes and the locations of compile errors. A local assistant, which does see the text, carries out tasks you give it with `delegate`, and reports back only which files changed and whether the project compiles.
-
-Your job is to understand the author's request, do any research it needs (web search and fetch are yours), and write the local assistant a complete, self-contained task: what to change, where (file and lines are in the context), how, in what style, including any facts, citations or snippets you found. Prefer one well-specified delegate call over many small ones. Compile to confirm the result. Then reply briefly to the author: what you asked for, what came back, and anything to check. Never ask the local assistant to send you the document's text.";
-
-const SYSTEM_QUARANTINED: &str = "You are the local assistant inside kloverleaf, a LaTeX editor. A coordinator that cannot see the document has given you a task, along with the author's original request and where they are in the document. Carry out the task on the scratch copy of the project: read what you need, make the edits with write_edits (exact, unique `old` strings — read first, then copy exactly), compile to check, and fix what you broke. Keep the author's voice, macros and conventions. You have no web access; if the task needs a fact you do not have, do the part you can and say what is missing. When done, reply briefly with what you changed.";
+When you are done, reply briefly in plain prose: what you changed and why, anything you could not do, and anything the author should check.";
 
 /// The WebSocket dispatcher: every action runs in its own task so the socket
 /// loop is never blocked; results come back as events on the project.
@@ -555,12 +814,18 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
                 return;
             }
             let ctx: Context = serde_json::from_value(v["context"].clone()).unwrap_or_default();
+            let req: ChoiceReq = serde_json::from_value(v.clone()).unwrap_or_default();
+            let choice = match app.ai.catalog.resolve(&req) {
+                Ok(c) => c,
+                Err(e) => {
+                    emit(json!({"event": "error", "message": format!("{e:#}")}));
+                    return;
+                }
+            };
+            app.ai.remember(&project);
             let session = match session_id {
-                Some(id) => match app.ai.session(id) {
-                    Some(s) if s.project.name == project.name => Ok(s),
-                    _ => Err(anyhow::anyhow!("no such session")),
-                },
-                None => app.ai.new_session(project.clone(), &user, &prompt),
+                Some(id) => app.ai.session(&project.name, id).ok_or_else(|| anyhow::anyhow!("that conversation is gone (applied, discarded, or its workspace was removed) — start a new one")),
+                None => app.ai.new_session(project.clone(), &user, &prompt, choice.clone()),
             };
             let s = match session {
                 Ok(s) => s,
@@ -572,22 +837,13 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
             let app2 = app.clone();
             let s2 = s.clone();
             let task = tokio::spawn(async move {
-                let emit = |mut ev: Value| {
-                    ev["session"] = json!(s2.id);
-                    ev["user"] = json!(s2.user);
-                    s2.project.emit_ai(ev);
-                };
-                emit(json!({"event": "started", "prompt": prompt, "mode": app2.ai.describe()}));
-                match app2.ai.run(&s2, &prompt, &ctx).await {
-                    Ok(o) => emit(json!({"event": "proposal", "text": o.text, "files": o.files, "model": o.model,
-                                         "usage": {"input": o.input_tokens, "output": o.output_tokens}})),
-                    Err(e) => emit(json!({"event": "error", "message": format!("{e:#}")})),
-                }
+                let _ = app2.ai.turn(&s2, &prompt, &ctx, choice).await;
             });
             *s.task.lock().unwrap() = Some(task.abort_handle());
         }
         "apply" => {
-            let Some(s) = session_id.and_then(|id| app.ai.session(id)) else {
+            app.ai.remember(&project);
+            let Some(s) = session_id.and_then(|id| app.ai.session(&project.name, id)) else {
                 emit(json!({"event": "error", "message": "no such session"}));
                 return;
             };
@@ -600,31 +856,24 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
                 })
                 .unwrap_or_default();
             tokio::spawn(async move {
-                let emit = |mut ev: Value| {
-                    ev["session"] = json!(s.id);
-                    ev["user"] = json!(s.user);
-                    s.project.emit_ai(ev);
-                };
                 match app.ai.apply(&s, files).await {
-                    Ok(applied) => emit(json!({"event": "applied", "files": applied})),
-                    Err(e) => emit(json!({"event": "error", "message": format!("{e:#}")})),
+                    Ok(applied) => s.emit(json!({"event": "applied", "files": applied})),
+                    Err(e) => s.emit(json!({"event": "error", "message": format!("{e:#}")})),
                 }
             });
         }
         "discard" => {
-            if let Some(id) = session_id {
-                app.ai.end_session(id);
-                emit(json!({"event": "discarded"}));
+            app.ai.remember(&project);
+            if let Some(id) = session_id
+                && !app.ai.discard(&project.name, id)
+            {
+                emit(json!({"event": "discarded"})); // the panel still wants to clear
             }
         }
         "cancel" => {
-            if let Some(s) = session_id.and_then(|id| app.ai.session(id)) {
-                s.cancel.store(true, Ordering::Relaxed);
-                if let Some(t) = s.task.lock().unwrap().take() {
-                    t.abort();
-                }
-                s.busy.store(false, Ordering::Relaxed);
-                emit(json!({"event": "cancelled"}));
+            if let Some(s) = session_id.and_then(|id| app.ai.session(&project.name, id)) {
+                s.stop();
+                s.emit(json!({"event": "cancelled"}));
             }
         }
         _ => emit(json!({"event": "error", "message": format!("unknown action {action:?}")})),
@@ -634,7 +883,6 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use provider::Mock;
 
     async fn project() -> (std::path::PathBuf, Project) {
         let root = crate::history::tmp_dir("ai");
@@ -644,62 +892,102 @@ mod tests {
         (root, p)
     }
 
+    /// A stand-in for the CLI: echoes stream-json the way `claude -p` does.
+    /// It edits nothing itself (that is the MCP server's job, exercised below).
+    fn fake_claude(root: &std::path::Path, body: &str) -> Catalog {
+        let bin = root.join("fake-claude");
+        std::fs::write(&bin, format!("#!/bin/sh\ncat >/dev/null\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Catalog {
+            claude: Ok(ProviderInfo { bin: bin.to_string_lossy().into_owned(), models: vec!["test-model".into()], efforts: claude::EFFORTS.to_vec(), home: PathBuf::new() }),
+            codex: Err("not in tests".into()),
+            default: Choice { provider: Provider::Claude, model: "test-model".into(), effort: "low".into() },
+        }
+    }
+
     #[tokio::test]
-    async fn single_mode_produces_a_proposal_and_applies_it() {
+    async fn a_turn_edits_through_mcp_and_applies_as_a_proposal() {
         let (root, p) = project().await;
-        let mock = Mock::new(vec![
-            vec![json!({"type": "tool_use", "id": "t1", "name": "write_edits", "input": {"path": "main.tex", "edits": [{"old": "SECRET sentence.", "new": "Public sentence."}]}})],
-            vec![json!({"type": "text", "text": "Replaced the sentence."})],
-        ]);
-        let ai = Ai::new(Mode::Single(Arc::new(Provider::Mock(mock))), Duration::from_secs(30));
-        let s = ai.new_session(p.clone(), "kris", "make it public").unwrap();
+        let catalog = fake_claude(
+            &root,
+            r#"echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+echo '{"type":"assistant","message":{"model":"claude-test","content":[{"type":"text","text":"Working."}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced the sentence.","session_id":"sess-1","usage":{"input_tokens":10,"cache_read_input_tokens":5,"output_tokens":3}}'"#,
+        );
+        let ai = Ai::new(catalog, Duration::from_secs(30), 7200);
+        let pick = ai.catalog.resolve(&ChoiceReq::default()).unwrap();
+        assert_eq!(pick.model, "test-model");
+        assert!(ai.catalog.resolve(&ChoiceReq { model: Some("nope".into()), ..Default::default() }).is_err());
+        assert!(ai.catalog.resolve(&ChoiceReq { provider: Some(Provider::Codex), ..Default::default() }).is_err());
+        let s = ai.new_session(p.clone(), "kris", "make it public", pick).unwrap();
+        // What the CLI would do through /mcp: an exact edit on the workspace.
+        let r = mcp::execute(&s.ws, "write_edits", &json!({"path": "main.tex", "edits": [{"old": "SECRET sentence.", "new": "Public sentence."}]})).await.unwrap();
+        assert!(r.summary.starts_with("edited main.tex"));
         let ctx = Context { file: Some("main.tex".into()), line: Some(3), ..Default::default() };
-        let o = ai.run(&s, "make it public", &ctx).await.unwrap();
+        let o = ai.run(&s, "make it public", &ctx, None).await.unwrap();
         assert_eq!(o.text, "Replaced the sentence.");
+        assert_eq!(o.model, "claude-test");
+        assert_eq!((o.input_tokens, o.output_tokens), (15, 3));
+        assert_eq!(s.agent_session.lock().unwrap().as_deref(), Some("sess-1"));
         assert_eq!(o.files.len(), 1);
         assert!(o.files[0].after.contains("Public sentence."));
         assert!(p.text("main.tex").unwrap().contains("SECRET"), "nothing applied yet");
         let files = o.files.iter().map(|f| (f.path.clone(), f.after.clone())).collect();
         ai.apply(&s, files).await.unwrap();
         assert!(p.text("main.tex").unwrap().contains("Public sentence."));
-        assert!(ai.session(s.id).is_none());
+        assert!(ai.session(&p.name, s.id).is_none());
+        assert!(!s.ws.dir.exists(), "workspace removed");
         let head = p.history.entry(p.history.head("main.tex").unwrap()).unwrap();
         assert_eq!(head.kind, "ai");
         assert_eq!(head.meta["prompt"], "make it public");
+        assert_eq!(head.meta["model"], "claude-test");
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn dual_mode_keeps_text_away_from_the_privileged_model() {
+    async fn a_failed_turn_is_an_error_not_a_proposal() {
         let (root, p) = project().await;
-        let privileged = Arc::new(Provider::Mock(Mock::new(vec![
-            vec![json!({"type": "tool_use", "id": "r", "name": "read_file", "input": {"path": "main.tex"}})],
-            vec![json!({"type": "tool_use", "id": "d", "name": "delegate", "input": {"task": "Replace the secret sentence with a public one."}})],
-            vec![json!({"type": "text", "text": "Done via the local assistant."})],
-        ])));
-        let quarantined = Arc::new(Provider::Mock(Mock::new(vec![
-            vec![json!({"type": "tool_use", "id": "q1", "name": "write_edits", "input": {"path": "main.tex", "edits": [{"old": "SECRET sentence.", "new": "Public sentence."}]}})],
-            vec![json!({"type": "text", "text": "I replaced SECRET."})],
-        ])));
-        let ai = Ai::new(Mode::Dual { privileged: privileged.clone(), quarantined: quarantined.clone() }, Duration::from_secs(30));
-        let s = ai.new_session(p.clone(), "kris", "make it public").unwrap();
+        let catalog = fake_claude(&root, r#"echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"x"}'"#);
+        let pick = catalog.default.clone();
+        let ai = Ai::new(catalog, Duration::from_secs(30), 7200);
+        let s = ai.new_session(p.clone(), "kris", "x", pick.clone()).unwrap();
+        let e = ai.run(&s, "x", &Context::default(), None).await.unwrap_err().to_string();
+        assert!(e.contains("error_during_execution"), "{e}");
+        let silent = fake_claude(&root, "exit 3");
+        let ai = Ai::new(silent, Duration::from_secs(30), 7200);
+        let s = ai.new_session(p.clone(), "kris", "x", pick.clone()).unwrap();
+        let e = ai.run(&s, "x", &Context::default(), None).await.unwrap_err().to_string();
+        assert!(e.contains("without a result"), "{e}");
+        let other = Choice { provider: Provider::Codex, model: "gpt".into(), effort: "low".into() };
+        let e = ai.run(&s, "x", &Context::default(), Some(other)).await.unwrap_err().to_string();
+        assert!(e.contains("new conversation"), "{e}");
+        let off = Ai::new(Catalog { claude: Err("no CLI".into()), codex: Err("no codex".into()), default: pick.clone() }, Duration::from_secs(30), 7200);
+        assert!(off.new_session(p, "kris", "x", pick).is_err());
+        assert_eq!(off.describe()["mode"], "off");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_mentions_everything_the_author_pointed_at() {
+        let dir = crate::history::tmp_dir("ctx");
+        std::fs::write(dir.join("main.tex"), "a\nb\nc\n").unwrap();
+        let ws = Workspace { dir: dir.clone(), latex_timeout: Duration::from_secs(1) };
         let ctx = Context {
             file: Some("main.tex".into()),
-            line: Some(3),
-            selection: Some(Region { file: "main.tex".into(), from: 3, to: 3, text: "SECRET sentence.".into(), note: None }),
-            ..Default::default()
+            line: Some(2),
+            selection: Some(Region { file: "main.tex".into(), from: 2, to: 2, text: "b".into(), note: Some("here".into()) }),
+            queue: vec![],
+            pdf: Some(PdfClick { page: 3, file: Some("main.tex".into()), line: Some(1), ..Default::default() }),
+            column: None,
         };
-        let o = ai.run(&s, "make it public", &ctx).await.unwrap();
-        assert_eq!(o.files.len(), 1);
-        assert!(o.files[0].after.contains("Public sentence."));
-        let Provider::Mock(m) = &*privileged else { unreachable!() };
-        let shown = serde_json::to_string(&*m.seen.lock().unwrap()).unwrap();
-        assert!(!shown.contains("SECRET"), "privileged model saw document text: {shown}");
-        assert!(shown.contains("lines 3-3"), "privileged model should still know locations");
-        assert!(shown.contains("not a text file") || shown.contains("unknown tool") || shown.contains("error"), "read_file must be refused in metadata scope");
-        let Provider::Mock(q) = &*quarantined else { unreachable!() };
-        let qshown = serde_json::to_string(&*q.seen.lock().unwrap()).unwrap();
-        assert!(qshown.contains("SECRET sentence."), "quarantined model gets the text");
-        std::fs::remove_dir_all(root).unwrap();
+        let s = context_block(&ctx, &ws, &[]);
+        for needle in ["main.tex (main)", "Cursor: main.tex line 2", "lines 2-2 — note: here", "page 3, which SyncTeX maps to main.tex line 1", "no information yet", "## Current file: main.tex"] {
+            assert!(s.contains(needle), "missing {needle:?} in {s}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

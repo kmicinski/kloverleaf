@@ -32,6 +32,23 @@ async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The checked-out branch name.
+pub async fn current_branch(dir: &Path) -> anyhow::Result<String> {
+    Ok(git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?.trim().to_string())
+}
+
+/// Switches to `name`, creating it from HEAD when `create`. The caller has
+/// committed first, so the working tree is clean and the switch cannot fail
+/// on local changes; `.kloverleaf/` is ignored and untouched.
+pub async fn checkout(dir: &Path, name: &str, create: bool) -> anyhow::Result<()> {
+    if create {
+        git(dir, &["checkout", "-q", "-b", name]).await?;
+    } else {
+        git(dir, &["checkout", "-q", name]).await?;
+    }
+    Ok(())
+}
+
 /// Makes `dir` a repository if it is not one; idempotent.
 pub async fn init(dir: &Path) -> anyhow::Result<()> {
     if !dir.join(".git").exists() {
@@ -40,14 +57,20 @@ pub async fn init(dir: &Path) -> anyhow::Result<()> {
     git(dir, &["config", "receive.denyCurrentBranch", "updateInstead"]).await?;
     git(dir, &["config", "user.name", "kloverleaf"]).await?;
     git(dir, &["config", "user.email", "kloverleaf@localhost"]).await?;
+    ensure_ignore(dir)?;
+    Ok(())
+}
+
+/// `.kloverleaf/` must stay out of git (the history database lives there);
+/// adds the line if the project's `.gitignore` lacks it. Idempotent.
+pub fn ensure_ignore(dir: &Path) -> std::io::Result<()> {
     let ignore = dir.join(".gitignore");
     let want = ".kloverleaf/\n";
     match std::fs::read_to_string(&ignore) {
-        Ok(s) if s.lines().any(|l| l.trim() == ".kloverleaf/" || l.trim() == ".kloverleaf") => {}
-        Ok(s) => std::fs::write(&ignore, format!("{}{}{want}", s, if s.ends_with('\n') || s.is_empty() { "" } else { "\n" }))?,
-        Err(_) => std::fs::write(&ignore, want)?,
+        Ok(s) if s.lines().any(|l| l.trim() == ".kloverleaf/" || l.trim() == ".kloverleaf") => Ok(()),
+        Ok(s) => std::fs::write(&ignore, format!("{}{}{want}", s, if s.ends_with('\n') || s.is_empty() { "" } else { "\n" })),
+        Err(_) => std::fs::write(&ignore, want),
     }
-    Ok(())
 }
 
 pub async fn is_dirty(dir: &Path) -> bool {

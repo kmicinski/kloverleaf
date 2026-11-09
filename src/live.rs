@@ -40,15 +40,16 @@
 
 use crate::build::{self, Compiled, Diagnostic};
 use crate::history::Store;
+use crate::provenance::{self, Map};
 use crate::project::{self, FileInfo};
 use crate::text::{self, Edit};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, io};
@@ -89,14 +90,21 @@ impl BuildOutcome {
 }
 
 pub enum Event {
-    Changed { file: String, change: Change, origin: u64 },
+    /// `prov`: for a delta, the typist's origin id; for a text, `{spans, origins}`.
+    Changed { file: String, change: Change, origin: u64, user: String, prov: Value },
+    /// The provenance of a file changed without its text (a claim).
+    Provenance { file: String, prov: Value },
     Saved { file: String, error: Option<String> },
     Building,
     Built(Arc<BuildOutcome>),
     Lock(Option<Lock>),
     Files { files: Vec<FileInfo>, main: Option<String> },
     Committed { sha: String, message: String },
+    /// The project moved to another branch: every text is new, reopen everything.
+    Branch { name: String },
     Ai(Value),
+    /// The tracked upstream repository's state changed (see `upstream.rs`).
+    Upstream(Value),
 }
 
 enum BuildReq {
@@ -108,6 +116,8 @@ struct DocState {
     text: String,
     version: u64,
     saved: u64,
+    /// Who wrote each run of the text (see `provenance.rs`); always as long as `text`.
+    prov: Map,
 }
 
 /// Handle to a project's live state; clones share it.
@@ -129,6 +139,12 @@ pub struct Inner {
     /// Serialises compiles of historical versions (time travel), so scrubbing
     /// the timeline never runs more than one latexmk at a time.
     preview: tokio::sync::Mutex<()>,
+    human_origins: Mutex<HashMap<String, u32>>,
+    /// When a person last changed a text, and who (the upstream poller waits
+    /// for quiet before pulling, and pushes as them once they have left).
+    last_edit: Mutex<(i64, String)>,
+    /// Open editor connections.
+    viewers: AtomicUsize,
 }
 
 impl std::ops::Deref for Project {
@@ -145,11 +161,18 @@ impl Project {
         fs::create_dir_all(dir.join(project::PRIVATE_DIR))?;
         let history = Store::open(&dir.join(project::PRIVATE_DIR).join("history.sqlite"))
             .map_err(|e| io::Error::other(e.to_string()))?;
+        // The branch the working tree is on, remembered across restarts.
+        if let Ok(b) = fs::read_to_string(dir.join(project::PRIVATE_DIR).join("branch"))
+            && history.branch_exists(b.trim())
+        {
+            history.set_branch(b.trim());
+        }
         let files = project::list_files(&dir);
         let mut docs = BTreeMap::new();
         for f in files.iter().filter(|f| f.text) {
             if let Ok(text) = fs::read_to_string(dir.join(&f.path)) {
-                docs.insert(f.path.clone(), DocState { text, version: 0, saved: 0 });
+                let prov = history.provenance(&f.path).unwrap_or_default().fitted(&text);
+                docs.insert(f.path.clone(), DocState { text, version: 0, saved: 0, prov });
             }
         }
         let main = project::main_file(&dir, &files);
@@ -167,6 +190,9 @@ impl Project {
             main: Mutex::new(main),
             latex_timeout,
             preview: tokio::sync::Mutex::new(()),
+            human_origins: Mutex::new(HashMap::new()),
+            last_edit: Mutex::new((0, String::new())),
+            viewers: AtomicUsize::new(0),
         });
         let project = Project(inner);
         tokio::spawn(build_loop(project.clone(), build_rx));
@@ -200,6 +226,23 @@ impl Project {
         self.emit(Event::Ai(v));
     }
 
+    pub fn emit_upstream(&self, v: Value) {
+        self.emit(Event::Upstream(v));
+    }
+
+    /// (ms, user) of the last change a person made.
+    pub fn last_edit(&self) -> (i64, String) {
+        self.last_edit.lock().unwrap().clone()
+    }
+
+    fn touched(&self, user: &str) {
+        *self.last_edit.lock().unwrap() = (crate::history::now_ms(), user.to_string());
+    }
+
+    pub fn viewers(&self) -> usize {
+        self.viewers.load(Ordering::Relaxed)
+    }
+
     pub fn text(&self, file: &str) -> Option<String> {
         self.docs.lock().unwrap().get(file).map(|d| d.text.clone())
     }
@@ -221,9 +264,19 @@ impl Project {
         anyhow::ensure!(self.text(file).is_some(), "no such text file");
         project::write_config(&self.dir, &project::Config { main: Some(file.into()) })?;
         *self.main.lock().unwrap() = Some(file.into());
-        self.emit(Event::Files { files: self.files(), main: Some(file.into()) });
+        self.files_changed();
         self.schedule_build();
         Ok(())
+    }
+
+    /// Re-detects the main file from what is on disk (after a file came or went).
+    fn refresh_main(&self) {
+        *self.main.lock().unwrap() = project::main_file(&self.dir, &self.files());
+    }
+
+    /// Tells every editor the file list (or the main file) changed.
+    fn files_changed(&self) {
+        self.emit(Event::Files { files: self.files(), main: self.main() });
     }
 
     pub fn latest(&self) -> Option<Arc<BuildOutcome>> {
@@ -275,6 +328,20 @@ impl Project {
         }
     }
 
+    /// `take` | `steal` | `release`, as the socket and the API spell it.
+    /// `Ok(held)` says whether `user` holds the lock afterwards.
+    pub fn lock_action(&self, user: &str, action: &str) -> Result<bool, &'static str> {
+        match action {
+            "take" => Ok(self.take_lock(user, false)),
+            "steal" => Ok(self.take_lock(user, true)),
+            "release" => {
+                self.release_lock(user);
+                Ok(false)
+            }
+            _ => Err("action: take | steal | release"),
+        }
+    }
+
     /// Renews the lock if `user` holds it (the editor pings while open).
     pub fn renew_lock(&self, user: &str) {
         let mut g = self.lock.lock().unwrap();
@@ -302,40 +369,273 @@ impl Project {
         }
         doc.text = next;
         doc.version += 1;
+        self.touched(user);
         let _ = self.history.record(file, user, "delta", Some(changes), &doc.text, json!({}));
+        let me = self.human_origin(user);
+        doc.prov.apply(changes, me);
+        let _ = self.history.set_provenance(file, &doc.prov);
         drop(docs);
-        self.after_change(file, Change::Delta(changes.to_vec()), origin);
+        self.after_change(file, Change::Delta(changes.to_vec()), origin, user, json!(me));
         Ok(())
     }
 
     /// Replaces the whole text of a file (tools, the AI, restores, git),
     /// creating the file if it is new. `kind` and `meta` go to the history.
     pub fn replace(&self, file: &str, text: String, origin: u64, user: &str, kind: &str, meta: Value) -> anyhow::Result<()> {
+        self.replace_if(file, None, text, origin, user, kind, meta).map(|_| ())
+    }
+
+    /// `replace`, but only if the file's text is still `expected` (`None` =
+    /// whatever it is) — the upstream merge's compare-and-swap, so a merge
+    /// computed from a text the person has since typed into is never applied.
+    /// `Ok(false)` when it was not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_if(&self, file: &str, expected: Option<&str>, text: String, origin: u64, user: &str, kind: &str, meta: Value) -> anyhow::Result<bool> {
         anyhow::ensure!(project::valid_path(file) && project::is_text(file), "not a text file path");
         let mut docs = self.docs.lock().unwrap();
-        let fresh = !docs.contains_key(file);
-        let doc = docs.entry(file.to_string()).or_insert(DocState { text: String::new(), version: 0, saved: 0 });
-        if !fresh && doc.text == text {
-            return Ok(());
+        if let Some(want) = expected
+            && docs.get(file).map(|d| d.text.as_str()) != Some(want)
+        {
+            return Ok(false);
         }
+        let fresh = !docs.contains_key(file);
+        let doc = docs.entry(file.to_string()).or_insert(DocState { text: String::new(), version: 0, saved: 0, prov: Map::default() });
+        if !fresh && doc.text == text {
+            return Ok(true);
+        }
+        if meta["source"] != "git" {
+            self.touched(user);
+        }
+        // The origin of whatever this replacement inserts: a person for their
+        // own new files and reconnects, one fresh origin per AI apply / push / restore / upload.
+        let origin_kind = provenance::origin_kind(kind, &meta);
+        let who = match origin_kind {
+            Some(k) => self.history.new_origin(k, user, &meta).unwrap_or(provenance::UNKNOWN),
+            None => self.human_origin(user),
+        };
+        let prov = doc.prov.rebase(&doc.text, &text, who);
         doc.text = text;
         doc.version += 1;
-        let _ = self.history.record(file, user, kind, None, &doc.text, meta);
+        let entry = self.history.record(file, user, kind, None, &doc.text, meta).ok();
+        if origin_kind.is_some()
+            && let Some(id) = entry
+        {
+            let _ = self.history.extend_origin(who, &json!({"entry": id, "file": file}));
+        }
+        doc.prov = prov;
+        let _ = self.history.set_provenance(file, &doc.prov);
         let change = Change::Text(doc.text.as_str().into());
+        let prov_msg = self.prov_value(&doc.prov);
         drop(docs);
         if fresh {
             self.save(file);
-            self.emit(Event::Files { files: self.files(), main: self.main() });
             if self.main().is_none() {
-                *self.main.lock().unwrap() = project::main_file(&self.dir, &self.files());
+                self.refresh_main();
+            }
+            self.files_changed();
+        }
+        self.after_change(file, change, origin, user, prov_msg);
+        Ok(true)
+    }
+
+    /// A project laid out from an upstream repository (`upstream::import`):
+    /// record every text in the history as written by one `git` origin.
+    pub fn imported(&self, who: &str, meta: Value) {
+        let origin = self.history.new_origin("git", who, &meta).unwrap_or(provenance::UNKNOWN);
+        let mut docs = self.docs.lock().unwrap();
+        let mut last = None;
+        for (file, doc) in docs.iter_mut() {
+            last = self.history.record(file, who, "replace", None, &doc.text, meta.clone()).ok().or(last);
+            doc.prov = Map::uniform(doc.text.encode_utf16().count(), origin);
+            let _ = self.history.set_provenance(file, &doc.prov);
+        }
+        if let Some(id) = last {
+            let _ = self.history.extend_origin(origin, &json!({"entry": id}));
+        }
+    }
+
+    // ---- branches ------------------------------------------------------------
+
+    pub fn branch(&self) -> String {
+        self.history.branch()
+    }
+
+    fn valid_branch(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name != "HEAD"
+            && !name.starts_with(['-', '.'])
+            && !name.ends_with(['.', '/'])
+            && !name.contains("..")
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+    }
+
+    /// Commits what is on this branch, so git and the history agree before a switch.
+    async fn settle(&self, user: &str, why: &str) {
+        self.flush();
+        if let Ok(Some(sha)) = crate::gitd::commit(&self.dir, why, Some(user)).await {
+            self.committed(&sha, why, user).await;
+        }
+    }
+
+    /// Makes the working tree be `texts` (the branch's files): every text file
+    /// written, text files not in the set removed, provenance loaded or
+    /// derived, everything announced so open editors reload.
+    fn adopt(&self, texts: BTreeMap<String, String>, derive_from_current: bool) -> anyhow::Result<()> {
+        let mut docs = self.docs.lock().unwrap();
+        let old: BTreeMap<String, (String, Map)> = docs.iter().map(|(f, d)| (f.clone(), (d.text.clone(), d.prov.clone()))).collect();
+        docs.clear();
+        for (file, text) in texts {
+            let prov = if derive_from_current {
+                // A fresh branch: what survives from the text we just left keeps
+                // its attribution; text that only existed back then is untracked.
+                match old.get(&file) {
+                    Some((otext, oprov)) => oprov.rebase(otext, &text, provenance::UNKNOWN),
+                    None => Map::uniform(text.encode_utf16().count(), provenance::UNKNOWN),
+                }
+            } else {
+                self.history.provenance(&file).unwrap_or_default().fitted(&text)
+            };
+            if derive_from_current {
+                let _ = self.history.set_provenance(&file, &prov);
+            }
+            let path = self.dir.join(&file);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(&path, &text)?;
+            docs.insert(file, DocState { text, version: 1, saved: 1, prov });
+        }
+        // Text files the snapshot lacks go away — but only ones the history
+        // ever recorded (a file that exists outside the history, like the
+        // .gitignore git itself needs, is not the snapshot's to remove).
+        for file in old.keys() {
+            if !docs.contains_key(file) && self.history.latest_for(file, i64::MAX).is_some() {
+                let _ = fs::remove_file(self.dir.join(file));
             }
         }
-        self.after_change(file, change, origin);
+        drop(docs);
+        let _ = crate::gitd::ensure_ignore(&self.dir);
+        let _ = fs::write(self.dir.join(project::PRIVATE_DIR).join("branch"), self.branch());
+        self.refresh_main();
+        self.files_changed();
+        self.emit(Event::Branch { name: self.branch() });
+        self.schedule_build();
         Ok(())
     }
 
-    fn after_change(&self, file: &str, change: Change, origin: u64) {
-        self.emit(Event::Changed { file: file.into(), change, origin });
+    /// Forks `name` at `from` (an entry id; None = the current state) and
+    /// switches to it. The new branch's working tree is that snapshot and a
+    /// git branch of the same name is created, so clones see it too.
+    pub async fn branch_from(&self, from: Option<i64>, name: &str, user: &str, note: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(Self::valid_branch(name), "branch names: letters, digits, . _ - /");
+        anyhow::ensure!(!self.history.branch_exists(name), "branch {name} already exists");
+        anyhow::ensure!(self.take_lock(user, false), "someone else holds the edit lock");
+        let parent = self.branch();
+        self.settle(user, "autosave before branching").await;
+        // The fork point: the given entry, or the newest entry we have now.
+        let from = match from {
+            Some(id) => {
+                let e = self.history.entry(id).ok_or_else(|| anyhow::anyhow!("no such entry"))?;
+                anyhow::ensure!(!e.file.is_empty() || e.kind == "commit", "that entry has no text to branch from");
+                id
+            }
+            None => self.history.list(None, None, None, 1, None).ok().and_then(|l| l.first().map(|e| e.id)).ok_or_else(|| anyhow::anyhow!("no history yet"))?,
+        };
+        let texts = self.history.files_at(from)?;
+        anyhow::ensure!(!texts.is_empty(), "nothing in the history at that point");
+        self.history.create_branch(name, &parent, from, user, note)?;
+        crate::gitd::checkout(&self.dir, name, true).await?;
+        self.history.set_branch(name);
+        self.adopt(texts, true)?;
+        let _ = self.history.note(user, "branch", json!({"from": from, "parent": parent}));
+        self.settle(user, &format!("branch {name} from #{from}")).await;
+        Ok(())
+    }
+
+    /// Switches the working tree to `name`'s latest state.
+    pub async fn switch_branch(&self, name: &str, user: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.history.branch_exists(name), "no branch {name}");
+        if self.branch() == name {
+            return Ok(());
+        }
+        anyhow::ensure!(self.take_lock(user, false), "someone else holds the edit lock");
+        self.settle(user, "autosave before switching branch").await;
+        let mut texts = BTreeMap::new();
+        for (file, entry) in self.history.branch_files(name) {
+            if let Some(t) = self.history.text_at(entry)? {
+                texts.insert(file, t);
+            }
+        }
+        crate::gitd::checkout(&self.dir, name, false).await?;
+        self.history.set_branch(name);
+        self.adopt(texts, false)?;
+        Ok(())
+    }
+
+    // ---- provenance ----------------------------------------------------------
+
+    /// `user`'s origin id (one per person per project, cached).
+    pub fn human_origin(&self, user: &str) -> u32 {
+        if let Some(id) = self.human_origins.lock().unwrap().get(user) {
+            return *id;
+        }
+        let id = self.history.human_origin(user).unwrap_or(provenance::UNKNOWN);
+        self.human_origins.lock().unwrap().insert(user.to_string(), id);
+        id
+    }
+
+    /// `{spans, origins}` — what the browser needs to colour a file.
+    fn prov_value(&self, map: &Map) -> Value {
+        let origins: serde_json::Map<String, Value> = self
+            .history
+            .origins(map.origins())
+            .into_iter()
+            .map(|o| (o.id.to_string(), serde_json::to_value(&o).unwrap_or(Value::Null)))
+            .collect();
+        json!({"spans": map.to_json(), "origins": origins})
+    }
+
+    pub fn provenance(&self, file: &str) -> Option<Value> {
+        let docs = self.docs.lock().unwrap();
+        docs.get(file).map(|d| self.prov_value(&d.prov))
+    }
+
+    pub fn origins(&self, ids: Vec<u32>) -> Vec<crate::provenance::Origin> {
+        self.history.origins(ids)
+    }
+
+    /// Marks `from..to` (UTF-16 offsets) of `file` as written by `user`.
+    pub fn claim(&self, file: &str, from: usize, to: usize, user: &str) -> anyhow::Result<()> {
+        let me = self.human_origin(user);
+        let mut docs = self.docs.lock().unwrap();
+        let doc = docs.get_mut(file).ok_or_else(|| anyhow::anyhow!("no such file"))?;
+        doc.prov.set(from, to, me);
+        let _ = self.history.set_provenance(file, &doc.prov);
+        let prov = self.prov_value(&doc.prov);
+        drop(docs);
+        self.emit(Event::Provenance { file: file.into(), prov });
+        Ok(())
+    }
+
+    /// Recomputes every file's map from the history (see `Store::rebuild_provenance`)
+    /// and tells open editors.
+    pub fn rebuild_provenance(&self) -> anyhow::Result<usize> {
+        let n = self.history.rebuild_provenance()?;
+        let mut events = Vec::new();
+        {
+            let mut docs = self.docs.lock().unwrap();
+            for (file, doc) in docs.iter_mut() {
+                doc.prov = self.history.provenance(file).unwrap_or_default().fitted(&doc.text);
+                events.push(Event::Provenance { file: file.clone(), prov: self.prov_value(&doc.prov) });
+            }
+        }
+        for e in events {
+            self.emit(e);
+        }
+        Ok(n)
+    }
+
+    fn after_change(&self, file: &str, change: Change, origin: u64, user: &str, prov: Value) {
+        self.emit(Event::Changed { file: file.into(), change, origin, user: user.into(), prov });
         self.schedule_build();
         let (p, file) = (self.clone(), file.to_string());
         let version = self.docs.lock().unwrap().get(&file).map(|d| d.version).unwrap_or(0);
@@ -385,7 +685,7 @@ impl Project {
         let full = self.dir.join(path);
         fs::create_dir_all(full.parent().unwrap())?;
         fs::write(full, bytes)?;
-        self.emit(Event::Files { files: self.files(), main: self.main() });
+        self.files_changed();
         self.schedule_build();
         Ok(())
     }
@@ -396,12 +696,13 @@ impl Project {
         anyhow::ensure!(full.is_file(), "no such file");
         if let Some(doc) = self.docs.lock().unwrap().remove(path) {
             let _ = self.history.record(path, user, "delete", None, "", json!({"size": doc.text.len()}));
+            self.history.delete_provenance(path);
         }
         fs::remove_file(full)?;
         if self.main().as_deref() == Some(path) {
-            *self.main.lock().unwrap() = project::main_file(&self.dir, &self.files());
+            self.refresh_main();
         }
-        self.emit(Event::Files { files: self.files(), main: self.main() });
+        self.files_changed();
         Ok(())
     }
 
@@ -435,8 +736,8 @@ impl Project {
                 self.docs.lock().unwrap().remove(&k);
             }
         }
-        *self.main.lock().unwrap() = project::main_file(&self.dir, &files);
-        self.emit(Event::Files { files, main: self.main() });
+        self.refresh_main();
+        self.files_changed();
         self.schedule_build();
         Ok(())
     }
@@ -581,6 +882,10 @@ async fn build_loop(p: Project, mut rx: mpsc::UnboundedReceiver<BuildReq>) {
 enum ClientMsg {
     Open { file: String },
     Edit { file: String, changes: Vec<Edit>, hash: u32 },
+    /// After a reconnect: the browser's text, which has edits the server never
+    /// saw (typed while the socket was down). Replaces the server's copy —
+    /// through `replace`, so provenance is rebased and the history records it.
+    Resync { file: String, text: String, hash: u32 },
     Ping,
     Lock { action: String },
     Ai(Value),
@@ -596,6 +901,21 @@ pub async fn session(socket: WebSocket, app: crate::Shared, project: Project, us
     let _ = run(socket, app, project, user).await;
 }
 
+type Sink = futures_util::stream::SplitSink<WebSocket, Message>;
+
+/// An edit the server would not take: say why, send its own text (so the
+/// client heals), and the lock when that was the reason.
+async fn refuse(sink: &mut Sink, p: &Project, file: &str, reason: &str) -> Result<(), axum::Error> {
+    sink.send(msg(json!({"type": "refused", "file": file, "reason": reason}))).await?;
+    if let Some(t) = p.text(file) {
+        sink.send(msg(json!({"type": "text", "file": file, "text": t, "prov": p.provenance(file)}))).await?;
+    }
+    if reason == "locked" {
+        sink.send(msg(json!({"type": "lock", "lock": p.lock()}))).await?;
+    }
+    Ok(())
+}
+
 async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) -> Result<(), axum::Error> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut rx = p.subscribe();
@@ -604,8 +924,21 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
         "type": "init", "user": user, "files": p.files(), "main": p.main(), "lock": p.lock(),
         "build": p.latest().map(|b| b.summary()), "building": p.building.load(Ordering::Relaxed),
         "ai": app.ai.describe(),
+        "origin": p.human_origin(&user),
+        "branch": p.branch(),
+        "upstream": crate::upstream::tracked(&p.dir),
     })))
     .await?;
+    p.viewers.fetch_add(1, Ordering::Relaxed);
+    let result = serve(&mut sink, &mut stream, &mut rx, &app, &p, &user, id).await;
+    p.viewers.fetch_sub(1, Ordering::Relaxed);
+    result
+}
+
+type Stream = futures_util::stream::SplitStream<WebSocket>;
+
+async fn serve(sink: &mut Sink, stream: &mut Stream, rx: &mut broadcast::Receiver<Arc<Event>>, app: &crate::Shared, p: &Project, user: &str, id: u64) -> Result<(), axum::Error> {
+    let (app, user) = (app.clone(), user.to_string());
     loop {
         tokio::select! {
             m = stream.next() => {
@@ -614,28 +947,30 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
                 };
                 match serde_json::from_str::<ClientMsg>(&text) {
                     Ok(ClientMsg::Open { file }) => match p.text(&file) {
-                        Some(t) => sink.send(msg(json!({"type": "text", "file": file, "text": t}))).await?,
+                        Some(t) => sink.send(msg(json!({"type": "text", "file": file, "text": t, "prov": p.provenance(&file)}))).await?,
                         None => sink.send(msg(json!({"type": "refused", "file": file, "reason": "no such file"}))).await?,
                     },
                     Ok(ClientMsg::Edit { file, changes, hash }) => {
                         if let Err(reason) = p.edit(&file, &changes, hash, id, &user) {
-                            sink.send(msg(json!({"type": "refused", "file": file, "reason": reason}))).await?;
-                            if let Some(t) = p.text(&file) {
-                                sink.send(msg(json!({"type": "text", "file": file, "text": t}))).await?;
-                            }
-                            if reason == "locked" {
-                                sink.send(msg(json!({"type": "lock", "lock": p.lock()}))).await?;
-                            }
+                            refuse(sink, p, &file, reason).await?;
+                        }
+                    }
+                    Ok(ClientMsg::Resync { file, text, hash }) => {
+                        if text::fnv1a(&text) != hash {
+                            continue; // mangled in transit; the client will ask again
+                        }
+                        if !p.take_lock(&user, false) {
+                            refuse(sink, p, &file, "locked").await?;
+                            continue;
+                        }
+                        match p.replace(&file, text, id, &user, "replace", json!({"source": "reconnect"})) {
+                            Ok(()) => sink.send(msg(json!({"type": "resynced", "file": file, "prov": p.provenance(&file)}))).await?,
+                            Err(e) => sink.send(msg(json!({"type": "refused", "file": file, "reason": e.to_string()}))).await?,
                         }
                     }
                     Ok(ClientMsg::Ping) => p.renew_lock(&user),
                     Ok(ClientMsg::Lock { action }) => {
-                        match action.as_str() {
-                            "take" => { p.take_lock(&user, false); }
-                            "steal" => { p.take_lock(&user, true); }
-                            "release" => p.release_lock(&user),
-                            _ => {}
-                        }
+                        let _ = p.lock_action(&user, &action);
                         sink.send(msg(json!({"type": "lock", "lock": p.lock()}))).await?;
                     }
                     Ok(ClientMsg::Ai(v)) => crate::ai::handle(app.clone(), p.clone(), user.clone(), id, v),
@@ -645,20 +980,23 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
             update = rx.recv() => match update {
                 Ok(ev) => {
                     let out = match &*ev {
-                        Event::Changed { file, change, origin } => {
+                        Event::Changed { file, change, origin, user: who, prov } => {
                             if *origin == id { continue }
                             match change {
-                                Change::Delta(changes) => json!({"type": "edit", "file": file, "changes": changes}),
-                                Change::Text(text) => json!({"type": "text", "file": file, "text": &**text}),
+                                Change::Delta(changes) => json!({"type": "edit", "file": file, "changes": changes, "user": who, "origin": prov}),
+                                Change::Text(text) => json!({"type": "text", "file": file, "text": &**text, "prov": prov}),
                             }
                         }
+                        Event::Provenance { file, prov } => json!({"type": "prov", "file": file, "prov": prov}),
                         Event::Saved { file, error } => json!({"type": "saved", "file": file, "error": error}),
                         Event::Building => json!({"type": "building"}),
                         Event::Built(b) => { let mut v = b.summary(); v["type"] = "built".into(); v }
                         Event::Lock(l) => json!({"type": "lock", "lock": l}),
                         Event::Files { files, main } => json!({"type": "files", "files": files, "main": main}),
                         Event::Committed { sha, message } => json!({"type": "committed", "sha": sha, "message": message}),
+                        Event::Branch { name } => json!({"type": "branch", "branch": name, "files": p.files(), "main": p.main()}),
                         Event::Ai(v) => { let mut v = v.clone(); v["type"] = "ai".into(); v }
+                        Event::Upstream(v) => { let mut v = v.clone(); v["type"] = "upstream".into(); v }
                     };
                     sink.send(msg(out)).await?;
                 }
@@ -680,6 +1018,49 @@ mod tests {
         let dir = crate::history::tmp_dir("live");
         fs::create_dir_all(dir.join("projects")).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn branches_fork_switch_and_keep_their_own_history() {
+        let root = root();
+        let p = Project::create(&root, "b", Duration::from_secs(30)).await.unwrap();
+        p.replace("main.tex", "one\n".into(), 0, "kris", "replace", json!({})).unwrap();
+        let at_one = p.history.head("main.tex").unwrap();
+        p.replace("main.tex", "one two\n".into(), 0, "kris", "replace", json!({})).unwrap();
+        p.replace("notes.tex", "scratch\n".into(), 0, "kris", "replace", json!({})).unwrap();
+        assert_eq!(p.branch(), "main");
+        // Fork at the "one" snapshot: the working tree becomes that snapshot.
+        p.branch_from(Some(at_one), "idea", "kris", "try something").await.unwrap();
+        assert_eq!(p.branch(), "idea");
+        assert_eq!(p.text("main.tex").unwrap(), "one\n");
+        assert!(p.text("notes.tex").is_none(), "a file created after the fork point is not on the branch");
+        assert!(!p.dir.join("notes.tex").exists());
+        assert_eq!(crate::gitd::current_branch(&p.dir).await.unwrap(), "idea");
+        // Work on the branch; main is untouched.
+        p.replace("main.tex", "one three\n".into(), 0, "kris", "replace", json!({})).unwrap();
+        let idea_head = p.history.head("main.tex").unwrap();
+        assert_eq!(p.history.entry(idea_head).unwrap().branch, "idea");
+        assert_eq!(p.history.text_at(idea_head).unwrap().unwrap(), "one three\n");
+        // The branch's timeline is its lineage: its own entry plus main up to the fork.
+        let ids: Vec<i64> = p.history.list(Some("main.tex"), None, None, 50, None).unwrap().iter().map(|e| e.id).collect();
+        assert!(ids.contains(&idea_head) && ids.contains(&at_one), "{ids:?}");
+        assert!(!ids.iter().any(|i| p.history.entry(*i).unwrap().meta.get("x").is_some()));
+        let main_texts = p.history.files_at(idea_head).unwrap();
+        assert_eq!(main_texts.get("main.tex").map(String::as_str), Some("one three\n"));
+        assert!(main_texts.get("notes.tex").is_none());
+        // Back to main: its latest state, notes.tex included.
+        p.switch_branch("main", "kris").await.unwrap();
+        assert_eq!(p.text("main.tex").unwrap(), "one two\n");
+        assert_eq!(p.text("notes.tex").unwrap(), "scratch\n");
+        assert_eq!(crate::gitd::current_branch(&p.dir).await.unwrap(), "main");
+        let branches = p.history.branches();
+        assert_eq!(branches.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), vec!["main", "idea"]);
+        assert_eq!(branches[1].from_entry, Some(at_one));
+        let tree = p.history.tree(100).unwrap();
+        assert!(tree.iter().any(|e| e.branch == "idea" && e.kind == "replace"));
+        assert!(p.history.story(5).starts_with("Branch: main"));
+        assert!(p.branch_from(None, "bad name", "kris", "").await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

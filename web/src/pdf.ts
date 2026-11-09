@@ -28,6 +28,7 @@ export class PdfViewer {
   private pages: PageSlot[] = [];
   private scale = 1;
   private fit = true;
+  private fitWidth = 0;
   private generation = 0;
   private observer: IntersectionObserver;
   private visible = new Set<number>();
@@ -45,7 +46,19 @@ export class PdfViewer {
         if (e.isIntersecting) { this.visible.add(i); void this.render(i); } else this.visible.delete(i);
       }
     }, { root: scroller, rootMargin: "600px 0px" });
-    new ResizeObserver(() => { if (this.fit && this.doc) void this.relayout(); }).observe(scroller);
+    // Coalesce resize bursts, and only refit when the width really moved: a
+    // refit that changes the page height can toggle the scrollbar, which
+    // changes the width, which refits… (the scroller also forces its scrollbar
+    // on in CSS so this cannot oscillate).
+    let timer: number | undefined;
+    new ResizeObserver(() => {
+      if (!this.fit || !this.doc) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        const w = this.scroller.clientWidth;
+        if (Math.abs(w - this.fitWidth) >= 2) void this.relayout();
+      }, 50);
+    }).observe(scroller);
   }
 
   /** Loads a (new version of the) PDF; pages re-render in place. */
@@ -72,7 +85,10 @@ export class PdfViewer {
     const doc = this.doc!;
     const first = await doc.getPage(1);
     const base = first.getViewport({ scale: 1 });
-    if (this.fit) this.scale = Math.max(0.2, (this.scroller.clientWidth - 36) / base.width);
+    if (this.fit) {
+      this.fitWidth = this.scroller.clientWidth;
+      this.scale = Math.max(0.2, (this.fitWidth - 36) / base.width);
+    }
     // Keep page elements that still exist so the scroll position survives.
     while (this.pages.length > doc.numPages) {
       const slot = this.pages.pop()!;
@@ -163,8 +179,8 @@ export class PdfViewer {
     }
     if (first) {
       first.scrollIntoView({ block: "center", behavior: "smooth" });
-      setTimeout(() => { for (const el of this.wrap.querySelectorAll(".sync-box")) (el as HTMLElement).style.opacity = "0"; }, 1800);
-      setTimeout(() => { for (const el of this.wrap.querySelectorAll(".sync-box")) el.remove(); }, 2600);
+      setTimeout(() => { for (const el of this.wrap.querySelectorAll(".sync-box")) (el as HTMLElement).style.opacity = "0"; }, 2400);
+      setTimeout(() => { for (const el of this.wrap.querySelectorAll(".sync-box")) el.remove(); }, 3200);
     }
   }
 }
