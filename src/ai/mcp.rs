@@ -177,7 +177,7 @@ pub async fn execute(ws: &Workspace, name: &str, input: &Value) -> Result<Reply,
             let c = build::compile(&ws.dir, &main, ws.latex_timeout).await.map_err(|e| format!("could not compile: {e:#}"))?;
             let errors = c.diagnostics.iter().filter(|d| d.severity == build::Severity::Error).count();
             let warnings = c.diagnostics.iter().filter(|d| d.severity == build::Severity::Warning).count();
-            let body = json!({"ok": c.ok, "ms": c.ms, "pdf": c.pdf.is_some(), "diagnostics": c.diagnostics});
+            let body = json!({"ok": c.ok, "ms": c.ms, "pdf": c.pdf.is_some() && !c.stale, "diagnostics": c.diagnostics});
             text(body.to_string(), format!("compiled in {}ms: {errors} error(s), {warnings} warning(s)", c.ms))
         }
         "view_pdf_page" => {

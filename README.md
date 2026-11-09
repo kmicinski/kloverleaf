@@ -59,8 +59,16 @@ change is noted in the history.
 **Compiling.** Typing pauses for 250ms → latexmk (`-pdf`, or `-xelatex` /
 `-lualatex` from a `% !TEX program =` comment) in `.kloverleaf/out` with
 SyncTeX. A document with errors still yields a PDF in nonstopmode, so you keep
-seeing pages; errors and warnings become markers in the editor and the log is
-a click away. The PDF stays in memory and is served from there; only a PDF
+seeing pages. Errors are reported where the fix goes, not where TeX gave up:
+an unclosed `\textbf{` at the command (not the `\input` line or the end of the
+document), an unclosed environment at its `\begin`, an undefined macro by name
+and underlined; echo errors (`Emergency stop`, a `$` closed at `\end{document}`,
+"Rerun to get …") are dropped, and each error carries a plain-words hint.
+BibTeX/biber errors come from the `.blg`. A bar under the editor shows the
+first error with *go to* and *✦ fix with AI* (the prompt carries the hint and
+TeX's excerpt) and opens into the full list; files with errors get a count in
+the tree. When TeX stops before writing a PDF, the PDF pane says the one shown
+is out of date. The PDF stays in memory and is served from there; only a PDF
 whose bytes changed is reloaded in the browser, and pages are re-rendered
 into fresh canvases that are swapped in one at a time, so nothing blanks.
 

@@ -654,58 +654,150 @@ $("pdf-out").addEventListener("click", () => pdf.zoom(1 / 1.2));
 $("pdf-fit").addEventListener("click", () => pdf.zoom("fit"));
 $("pdf-sync").addEventListener("click", () => void forwardSync());
 
-// ---- problems: the build status opens a list of every diagnostic; click to jump ------
+// ---- problems: a bar under the editor shows the first error (go to / fix with AI) and opens into the list ------
 
-let problemsEl: HTMLElement | null = null;
-function closeProblems(): void { problemsEl?.remove(); problemsEl = null; }
-buildEl.style.cursor = "pointer";
-buildEl.title = "click for the list of problems";
-buildEl.addEventListener("click", () => {
-  if (problemsEl) { closeProblems(); return; }
+const errbar = $("errbar");
+let problemsOpen = false;
+const clean = (f: string): string => f.replace(/^\.\//, "");
+const whereOf = (d: Diagnostic): string => `${clean(d.file)}${d.line ? `:${d.line}` : ""}`;
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text = ""): HTMLElementTagNameMap[K] {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text) e.textContent = text;
+  return e;
+}
+function btn(text: string, title: string, run: () => void, cls = "small"): HTMLButtonElement {
+  const b = el("button", cls, text);
+  b.title = title;
+  b.addEventListener("click", (e) => { e.stopPropagation(); run(); });
+  return b;
+}
+
+function goTo(d: Diagnostic): void {
+  const f = clean(d.file);
+  if (!f || !files.some((x) => x.path === f)) { status(`${whereOf(d)} is not a file in this project`); return; }
+  open(f, d.line ?? undefined, d.line ? d.column : undefined, true);
+}
+
+/** What the AI is asked: every error with its hint and TeX's own excerpt, first one first. */
+function fixPrompt(ds: Diagnostic[]): string {
+  const one = (d: Diagnostic): string => {
+    const lines = [`- ${whereOf(d)}${d.column ? ` (column ${d.column})` : ""}: ${d.message}`];
+    if (d.hint) lines.push(`  hint: ${d.hint}`);
+    if (d.context) lines.push(`  TeX's context:\n    ${d.context.replace(/\n/g, "\n    ")}`);
+    return lines.join("\n");
+  };
+  return ds.length === 1
+    ? `Fix this compile error:\n${one(ds[0])}\nChange only what is needed, then compile to confirm it is gone.`
+    : `Fix these ${ds.length} compile errors (the first often causes later ones):\n${ds.map(one).join("\n")}\nChange only what is needed, then compile to confirm they are gone.`;
+}
+
+function fixWithAi(ds: Diagnostic[]): void {
+  const d = ds[0];
+  const file = clean(d.file);
+  const text = d.line ? models.get(file)?.getLineContent(Math.min(d.line, models.get(file)!.getLineCount())) ?? "" : "";
+  ai.askAbout(fixPrompt(ds), d.line && models.has(file) ? { file, from: d.line, to: d.line, text } : undefined);
+}
+
+/** One problem: where (click to go), what, the hint, and TeX's excerpt folded away. */
+function problemRow(d: Diagnostic): HTMLElement {
+  const row = el("div", `problem ${d.severity}`);
+  const where = el("span", "where", whereOf(d) || "—");
+  where.addEventListener("click", () => goTo(d));
+  const body = el("div", "body");
+  body.append(el("span", "msg", d.message));
+  if (d.hint) body.append(el("span", "hint", d.hint));
+  if (d.context) {
+    const det = el("details");
+    det.append(el("summary", "", "what TeX printed"), el("pre", "", d.context));
+    body.append(det);
+  }
+  const btns = el("span", "btns");
+  if (d.line) btns.append(btn("go to", "show this line", () => goTo(d)));
+  if (d.severity === "error" || undefinedKey(d.message)) btns.append(btn("✦ fix", "ask the AI to fix this (you review the change before it is applied)", () => fixWithAi([d]), "small fix"));
+  row.append(where, body, btns);
+  row.addEventListener("click", (e) => { if (!(e.target as HTMLElement).closest("details,button")) goTo(d); });
+  return row;
+}
+
+function renderProblems(): void {
   const diags = lastBuild?.diags.filter((d) => d.severity !== "info") ?? [];
-  const box = document.createElement("div");
-  box.id = "problems";
-  if (!diags.length) {
-    const p = document.createElement("div");
-    p.className = "muted";
-    p.textContent = lastBuild ? "no errors or warnings" : "not compiled yet";
-    box.appendChild(p);
+  const errors = diags.filter((d) => d.severity === "error");
+  const warnings = diags.length - errors.length;
+  errbar.hidden = !errors.length && !problemsOpen;
+  errbar.classList.toggle("calm", !errors.length);
+  const head = el("div", "head");
+  const more = btn(problemsOpen ? "hide ▾" : `all ${diags.length} ▴`, "every error and warning from the last compile (or click the build status)", () => { problemsOpen = !problemsOpen; renderProblems(); });
+  if (errors.length) {
+    const d = errors[0];
+    head.append(el("span", "count", errors.length === 1 ? "✕ error" : `✕ 1 of ${errors.length} errors`));
+    const where = el("span", "where", whereOf(d));
+    where.title = "go to the error";
+    where.addEventListener("click", () => goTo(d));
+    const msg = el("span", "msg", d.message);
+    if (d.hint) msg.append(el("span", "hint", d.hint));
+    const btns = el("span", "btns");
+    if (d.line) btns.append(btn("go to", "show the line", () => goTo(d)));
+    btns.append(btn("✦ fix with AI", "ask the AI to fix it — you review the change before it is applied", () => fixWithAi([d]), "small fix"));
+    if (diags.length > 1 || problemsOpen) btns.append(more);
+    head.append(where, msg, btns);
+  } else {
+    head.append(el("span", "count", diags.length ? `no errors · ${warnings} warning${warnings === 1 ? "" : "s"}` : "no errors or warnings"));
+    const btns = el("span", "btns");
+    btns.append(btn("hide ▾", "close the list", () => { problemsOpen = false; renderProblems(); }));
+    head.append(btns);
   }
-  for (const d of diags) {
-    const row = document.createElement("div");
-    row.className = `problem ${d.severity}${/undefined/.test(d.message) ? " undefined" : ""}`;
-    const where = document.createElement("span");
-    where.className = "where";
-    where.textContent = `${d.file.replace(/^\.\//, "")}${d.line ? `:${d.line}` : ""}`;
-    const what = document.createElement("span");
-    what.textContent = d.message;
-    row.append(where, what);
-    if (d.line) row.addEventListener("click", () => { closeProblems(); open(d.file.replace(/^\.\//, ""), d.line!, undefined, true); });
-    box.appendChild(row);
+  const parts: HTMLElement[] = [head];
+  if (problemsOpen && diags.length) {
+    const list = el("div", "list");
+    if (errors.length > 1) {
+      const bulk = el("div", "bulk");
+      bulk.append(el("span", "", "Start with the first error: later ones are often caused by it."), btn(`✦ fix all ${errors.length} with AI`, "one request for every error", () => fixWithAi(errors), "small fix"));
+      list.append(bulk);
+    }
+    list.append(...diags.map(problemRow));
+    parts.push(list);
   }
-  const rect = buildEl.getBoundingClientRect();
-  box.style.left = `${Math.min(rect.left, window.innerWidth - 520)}px`;
-  box.style.top = `${rect.bottom + 4}px`;
-  document.body.appendChild(box);
-  problemsEl = box;
-  setTimeout(() => document.addEventListener("mousedown", (e) => { if (problemsEl && !problemsEl.contains(e.target as Node) && e.target !== buildEl) closeProblems(); }, { once: true }), 0);
-});
+  errbar.replaceChildren(...parts);
+}
+
+buildEl.style.cursor = "pointer";
+buildEl.title = "click for every error and warning";
+buildEl.addEventListener("click", () => { problemsOpen = !problemsOpen; renderProblems(); });
+
+/** The PDF pane says so when what it shows is older than the source. */
+function renderStale(b: Build): void {
+  const box = $("pdf-stale");
+  box.hidden = !(b.stale && b.hasPdf);
+  if (box.hidden) return;
+  const first = b.diags.find((d) => d.severity === "error");
+  box.replaceChildren(el("span", "", "⚠ Out of date: the last compile stopped before making a PDF, so this is the previous one."));
+  if (first) {
+    const w = el("span", "where", whereOf(first));
+    w.title = first.message;
+    w.addEventListener("click", () => goTo(first));
+    box.append(el("span", "", "Error at"), w);
+  }
+}
 
 function built(b: Build, initial: boolean): void {
   lastBuild = b;
-  if (problemsEl) { closeProblems(); }
   const errors = b.diags.filter((d) => d.severity === "error").length;
   const warnings = b.diags.filter((d) => d.severity === "warning").length;
   buildEl.textContent = errors ? `${errors} error${errors === 1 ? "" : "s"}` : `ok${warnings ? ` · ${warnings} warning${warnings === 1 ? "" : "s"}` : ""}`;
   buildEl.className = errors ? "err" : "muted";
   if (!initial) buildEl.textContent += ` · ${(b.ms / 1000).toFixed(1)}s`;
   markers(b.diags);
+  renderProblems();
+  renderStale(b);
+  renderFiles();
   if ((b.pdf || initial) && b.hasPdf) {
     $("pdf-empty").hidden = true;
     void pdf.load(`/project/${project}/pdf?v=${b.version}`);
   } else if (!b.hasPdf) {
     $("pdf-empty").hidden = false;
-    $("pdf-empty").textContent = errors ? "no PDF: fix the errors" : "no PDF yet";
+    $("pdf-empty").textContent = errors ? "no PDF: fix the error under the editor" : "no PDF yet";
   }
   if (!$("log-pane").hidden) void showLog();
 }
@@ -725,7 +817,9 @@ function markers(diags: Diagnostic[]): void {
     const mine = diags.filter((d) => d.file.replace(/^\.\//, "") === file);
     monaco.editor.setModelMarkers(m, "latex", mine.map((d) => {
       const line = Math.min(Math.max(d.line ?? 1, 1), m.getLineCount());
-      let startColumn = 1, endColumn = m.getLineMaxColumn(line);
+      const max = m.getLineMaxColumn(line);
+      let startColumn = 1, endColumn = max;
+      if (d.column && d.column < max) { startColumn = d.column; endColumn = Math.min(Math.max(d.end_column ?? d.column + 1, d.column + 1), max); }
       let severity = sev[d.severity];
       const u = undefinedKey(d.message);
       if (u) {
@@ -735,7 +829,7 @@ function markers(diags: Diagnostic[]): void {
         const i = text.indexOf(`{${u.key}}`) >= 0 ? text.indexOf(`{${u.key}}`) + 1 : text.indexOf(u.key);
         if (i >= 0) { startColumn = i + 1; endColumn = i + 1 + u.key.length; }
       }
-      return { severity, message: d.message, startLineNumber: line, startColumn, endLineNumber: line, endColumn, code: u ? `undefined-${u.kind}` : undefined };
+      return { severity, message: d.hint ? `${d.message}\n\n${d.hint}` : d.message, startLineNumber: line, startColumn, endLineNumber: line, endColumn, code: u ? `undefined-${u.kind}` : undefined };
     }));
   }
 }
@@ -761,7 +855,7 @@ function registerQuickFixes(): void {
         }
         const file = current ?? "";
         actions.push({
-          title: `Fix with AI: ${mk.message.slice(0, 60)}${mk.message.length > 60 ? "…" : ""}`, kind: "quickfix", diagnostics: [mk],
+          title: `Fix with AI: ${mk.message.split("\n")[0].slice(0, 60)}${mk.message.length > 60 ? "…" : ""}`, kind: "quickfix", diagnostics: [mk],
           command: { id: "kloverleaf.ai.fix", title: "Fix with AI", arguments: [{ file, line: mk.startLineNumber, message: mk.message }] },
         });
       }
@@ -770,7 +864,8 @@ function registerQuickFixes(): void {
     },
   });
   monaco.editor.registerCommand("kloverleaf.ai.fix", (_accessor, arg: { file: string; line: number; message: string }) => {
-    ai.askAbout(`Fix this compile problem at ${arg.file} line ${arg.line}: ${arg.message}. Change only what is needed, then compile to confirm.`, { file: arg.file, from: arg.line, to: arg.line, text: models.get(arg.file)?.getLineContent(arg.line) ?? "" });
+    const d = lastBuild?.diags.find((x) => clean(x.file) === arg.file && x.line === arg.line && arg.message.startsWith(x.message));
+    fixWithAi([d ?? { file: arg.file, line: arg.line, severity: "error", message: arg.message }]);
   });
 }
 
@@ -851,6 +946,12 @@ function renderFiles(): void {
     a.title = `${f.size} bytes`;
     a.addEventListener("click", (e) => { e.preventDefault(); open(f.path); });
     li.appendChild(a);
+    const errs = lastBuild?.diags.filter((d) => d.severity === "error" && clean(d.file) === f.path).length ?? 0;
+    if (errs) {
+      const badge = document.createElement("span");
+      badge.className = "badge"; badge.textContent = String(errs); badge.title = `${errs} error${errs === 1 ? "" : "s"} in this file`;
+      li.appendChild(badge);
+    }
     const actions = document.createElement("span");
     actions.className = "actions";
     if (f.text && f.path.endsWith(".tex") && f.path !== main) {
@@ -1340,7 +1441,7 @@ function leaveTravel(): void {
 const divider = $("divider");
 divider.addEventListener("pointerdown", (e) => {
   divider.setPointerCapture(e.pointerId);
-  const left = $("editor").getBoundingClientRect().left;
+  const left = $("editor-col").getBoundingClientRect().left;
   const move = (ev: PointerEvent) => document.documentElement.style.setProperty("--editor-width", `${Math.max(240, ev.clientX - left)}px`);
   const up = () => { divider.removeEventListener("pointermove", move); divider.removeEventListener("pointerup", up); };
   divider.addEventListener("pointermove", move);

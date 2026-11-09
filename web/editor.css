@@ -32,7 +32,8 @@ textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: i
 main { flex: 1; min-height: 0; display: flex; }
 #files { width: var(--files-width); flex: none; border-right: 1px solid #eee8d5; overflow: auto; font-size: .9em; }
 #files[hidden] { display: none; }
-#editor { width: var(--editor-width); min-width: 240px; flex: none; }
+#editor-col { width: var(--editor-width); min-width: 240px; flex: none; display: flex; flex-direction: column; min-height: 0; }
+#editor { flex: 1; min-height: 0; }
 #divider { width: 6px; flex: none; background: #eee8d5; cursor: col-resize; }
 #divider:hover { background: #b58900; }
 #pdf-pane { flex: 1; min-width: 200px; display: flex; flex-direction: column; background: #e8e2cf; position: relative; }
@@ -157,7 +158,7 @@ body.ai-open #pdf-toolbar, body.ai-open #pdf-scroll, body.ai-open #pdf-empty { v
 .tt-after { border-bottom: 2px solid #859900; }
 .tt-before { border-top: 2px solid #859900; }
 .tt-glyph { background: #dc322f; width: 4px !important; margin-left: 4px; }
-body.time-travel #editor { box-shadow: inset 0 0 0 3px #b58900; }
+body.time-travel #editor-col { box-shadow: inset 0 0 0 3px #b58900; }
 #log-pane { position: fixed; left: 0; right: 0; bottom: 0; height: 32vh; margin: 0; padding: .5rem .9rem; overflow: auto; background: #002b36; color: #93a1a1; font-size: 12px; border-top: 2px solid #b58900; z-index: 9; white-space: pre-wrap; }
 #log-pane[hidden] { display: none; }
 
@@ -209,15 +210,36 @@ body.prov-hidden .prov-ai, body.prov-hidden .prov-git, body.prov-hidden .prov-im
 #history-tree .node:hover { fill: #268bd2; }
 #history-tree .here { fill: none; stroke: #b58900; stroke-width: 2; pointer-events: none; }
 
-/* ---- problems list, keys sheet, section AI badges ---- */
-#problems { position: fixed; z-index: 45; max-width: 520px; max-height: 60vh; overflow: auto; background: #fdf6e3; border: 1px solid #d9d2bd; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.15); padding: .3rem 0; font-size: .88em; }
-#problems .problem { display: flex; gap: .6rem; padding: .3rem .8rem; cursor: pointer; border-left: 3px solid transparent; }
-#problems .problem:hover { background: #eee8d5; }
-#problems .problem.error { border-left-color: #dc322f; }
-#problems .problem.warning { border-left-color: #b58900; }
-#problems .problem.undefined { border-left-color: #dc322f; }
-#problems .where { color: #93a1a1; font-family: "SF Mono", Menlo, monospace; font-size: .9em; white-space: nowrap; }
-#problems .muted { padding: .4rem .8rem; }
+/* ---- problems: the error bar under the editor (opens into the list), stale-PDF banner, keys sheet, section AI badges ---- */
+#errbar { flex: none; border-top: 2px solid #dc322f; background: #fdf6e3; font-size: .88em; display: flex; flex-direction: column; max-height: 45vh; }
+#errbar[hidden] { display: none; }
+#errbar.calm { border-top-color: #d9d2bd; }
+#errbar .head { display: flex; align-items: baseline; gap: .5rem; padding: .35rem .6rem; flex-wrap: wrap; }
+#errbar .count { color: #dc322f; font-weight: 600; white-space: nowrap; }
+#errbar.calm .count { color: #93a1a1; font-weight: 400; }
+#errbar .where { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: .9em; color: #268bd2; white-space: nowrap; cursor: pointer; }
+#errbar .where:hover { text-decoration: underline; }
+#errbar .msg { color: #073642; flex: 1 1 14rem; min-width: 0; }
+#errbar .hint { display: block; color: #657b83; font-size: .95em; margin-top: .1rem; }
+#errbar .btns { display: flex; gap: .3rem; margin-left: auto; }
+#errbar button.fix { background: #6c71c4; border-color: #6c71c4; color: #fdf6e3; }
+#errbar button.fix:hover { background: #5b60b0; }
+#errbar .list { overflow: auto; border-top: 1px solid #eee8d5; padding-bottom: .3rem; }
+#errbar .list .bulk { padding: .35rem .6rem; display: flex; gap: .5rem; align-items: center; color: #93a1a1; }
+#errbar .problem { display: flex; gap: .5rem; align-items: baseline; padding: .3rem .6rem; border-left: 3px solid transparent; }
+#errbar .problem:hover { background: #eee8d5; }
+#errbar .problem.error { border-left-color: #dc322f; }
+#errbar .problem.warning { border-left-color: #b58900; }
+#errbar .problem .body { flex: 1; min-width: 0; }
+#errbar details { margin-top: .15rem; }
+#errbar summary { cursor: pointer; color: #93a1a1; font-size: .9em; }
+#errbar pre { margin: .2rem 0 0; padding: .3rem .5rem; background: #eee8d5; border-radius: 4px; font-size: .85em; white-space: pre-wrap; word-break: break-all; color: #586e75; }
+#build.err { text-decoration: underline dotted; }
+#file-list .badge { flex: none; min-width: 1.1em; text-align: center; border-radius: 8px; padding: 0 .3rem; font-size: .75em; background: #dc322f; color: #fdf6e3; }
+#pdf-stale { flex: none; padding: .4rem .7rem; background: #fbe3d9; color: #873a1f; border-bottom: 1px solid #e6bfae; font-size: .85em; display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
+#pdf-stale[hidden] { display: none; }
+#pdf-stale .where { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; color: #268bd2; cursor: pointer; }
+body.ai-open #pdf-stale { visibility: hidden; }
 #keys { position: fixed; right: 1rem; top: 3rem; z-index: 45; width: 360px; max-height: 80vh; overflow: auto; background: #fdf6e3; border: 1px solid #d9d2bd; border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.15); font-size: .88em; }
 #keys .key { display: flex; gap: .6rem; padding: .22rem .8rem; align-items: baseline; }
 #keys kbd { font-family: "SF Mono", Menlo, monospace; font-size: .85em; background: #eee8d5; border: 1px solid #d9d2bd; border-radius: 3px; padding: 0 .3rem; white-space: nowrap; min-width: 9rem; }

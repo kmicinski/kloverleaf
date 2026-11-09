@@ -177,11 +177,12 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
 </header>
 <main>
   <aside id="files"><div class="pane-title">files <span class="spacer"></span><button id="file-new" class="tiny" title="new file">+</button><button id="file-upload" class="tiny" title="upload">↑</button></div><ul id="file-list"></ul><div class="pane-title outline-title">outline</div><ul id="outline"></ul><input type="file" id="file-input" multiple hidden></aside>
-  <div id="editor"></div>
+  <div id="editor-col"><div id="editor"></div><div id="errbar" hidden></div></div>
   <div id="divider"></div>
   <div id="pdf-pane">
     <div id="pane-tabs"><button id="tab-pdf" class="tab on">pdf</button><button id="tab-ai" class="tab" title="ai (⌘⇧A)">✦ ai</button></div>
     <div id="pdf-toolbar"><button id="pdf-sync" class="small" title="show the cursor's position in the PDF (⌥⏎)">⇢ pdf</button><span class="spacer"></span><span id="pdf-pages" class="muted"></span><button id="pdf-out" class="small">−</button><button id="pdf-in" class="small">+</button><button id="pdf-fit" class="small">fit</button></div>
+    <div id="pdf-stale" hidden></div>
     <div id="pdf-scroll"><div id="pdf-pages-wrap"></div></div>
     <div id="pdf-empty" class="muted">compiling…</div>
     <aside id="ai-panel" hidden>

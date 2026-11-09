@@ -77,6 +77,8 @@ pub struct BuildOutcome {
     pub ms: u64,
     pub pdf: Option<Arc<Vec<u8>>>,
     pub pdf_changed: bool,
+    /// The PDF is an earlier build's: this one stopped before writing one.
+    pub stale: bool,
     pub log: String,
 }
 
@@ -85,6 +87,7 @@ impl BuildOutcome {
         json!({
             "version": self.version, "ok": self.ok, "diags": self.diagnostics,
             "ms": self.ms, "pdf": self.pdf_changed, "hasPdf": self.pdf.is_some(),
+            "stale": self.stale,
         })
     }
 }
@@ -778,7 +781,7 @@ impl Project {
         let ws = crate::ai::tools::make_workspace(&dir, &self.dir, &texts, self.latex_timeout)?;
         let main = ws.main().ok_or_else(|| anyhow::anyhow!("no main .tex file at that point"))?;
         let compiled = build::compile(&dir, &main, self.latex_timeout).await?;
-        let pdf = compiled.pdf.ok_or_else(|| anyhow::anyhow!("that version does not compile to a PDF"))?;
+        let pdf = compiled.pdf.filter(|_| !compiled.stale).ok_or_else(|| anyhow::anyhow!("that version does not compile to a PDF"))?;
         fs::create_dir_all(&cache)?;
         fs::write(&cached, &pdf)?;
         Ok(pdf)
@@ -813,15 +816,11 @@ async fn build_loop(p: Project, mut rx: mpsc::UnboundedReceiver<BuildReq>) {
             let outcome = Arc::new(BuildOutcome {
                 version,
                 ok: false,
-                diagnostics: vec![Diagnostic {
-                    file: String::new(),
-                    line: None,
-                    severity: build::Severity::Error,
-                    message: "no main .tex file in this project".into(),
-                }],
+                diagnostics: vec![Diagnostic::new("", None, build::Severity::Error, "no main .tex file in this project")],
                 ms: 0,
                 pdf: None,
                 pdf_changed: false,
+                stale: false,
                 log: String::new(),
             });
             for w in waiters {
@@ -835,11 +834,11 @@ async fn build_loop(p: Project, mut rx: mpsc::UnboundedReceiver<BuildReq>) {
         p.flush();
         let compiled = build::compile(&p.dir, &main, p.latex_timeout).await;
         let outcome = match compiled {
-            Ok(Compiled { ok, diagnostics, pdf, log, ms }) => {
+            Ok(Compiled { ok, stale, diagnostics, pdf, log, ms }) => {
                 let hash = pdf.as_ref().map(|b| {
                     b.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3))
                 });
-                let pdf_changed = pdf.is_some() && hash != last_hash;
+                let pdf_changed = pdf.is_some() && !stale && hash != last_hash;
                 if pdf_changed {
                     version += 1;
                     last_hash = hash;
@@ -848,20 +847,17 @@ async fn build_loop(p: Project, mut rx: mpsc::UnboundedReceiver<BuildReq>) {
                     Some(b) => Some(Arc::new(b)),
                     None => p.latest().and_then(|l| l.pdf.clone()),
                 };
-                BuildOutcome { version, ok, diagnostics, ms, pdf, pdf_changed, log }
+                let stale = stale && pdf.is_some();
+                BuildOutcome { version, ok, diagnostics, ms, pdf, pdf_changed, stale, log }
             }
             Err(e) => BuildOutcome {
                 version,
                 ok: false,
-                diagnostics: vec![Diagnostic {
-                    file: main.clone(),
-                    line: None,
-                    severity: build::Severity::Error,
-                    message: format!("could not run latexmk: {e:#}"),
-                }],
+                diagnostics: vec![Diagnostic::new(main.clone(), None, build::Severity::Error, format!("could not run latexmk: {e:#}"))],
                 ms: 0,
                 pdf: p.latest().and_then(|l| l.pdf.clone()),
                 pdf_changed: false,
+                stale: true,
                 log: String::new(),
             },
         };

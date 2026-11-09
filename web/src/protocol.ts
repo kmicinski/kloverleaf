@@ -5,9 +5,15 @@ import type { UpEvent } from "./upstream.js";
 
 export interface Edit { offset: number; length: number; text: string }
 export interface FileInfo { path: string; size: number; text: boolean }
-export interface Diagnostic { file: string; line: number | null; severity: "error" | "warning" | "info"; message: string }
+/** A compile problem. `column`/`end_column` (UTF-16, 1-based) mark the culprit when the log says where it is;
+ *  `hint` is what it usually means; `context` is TeX's own excerpt of the source around where it stopped. */
+export interface Diagnostic {
+  file: string; line: number | null; severity: "error" | "warning" | "info"; message: string;
+  column?: number; end_column?: number; hint?: string; context?: string;
+}
 export interface Lock { user: string; since: number; until: number }
-export interface Build { version: number; ok: boolean; diags: Diagnostic[]; ms: number; pdf: boolean; hasPdf: boolean }
+/** `stale`: this compile stopped before writing a PDF; the one shown is an earlier build's. */
+export interface Build { version: number; ok: boolean; diags: Diagnostic[]; ms: number; pdf: boolean; hasPdf: boolean; stale?: boolean }
 export interface Origin { id: number; kind: string; user: string; ts: number; meta: Record<string, unknown> }
 /** A file's provenance: run-length spans `[len, origin]` plus the origins they name. */
 export interface ProvPayload { spans: [number, number][]; origins: Record<string, Origin> }

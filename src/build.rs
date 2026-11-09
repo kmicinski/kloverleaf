@@ -13,17 +13,44 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Diagnostic {
     pub file: String,
     pub line: Option<usize>,
     pub severity: Severity,
     pub message: String,
+    /// 1-based UTF-16 columns (Monaco's) of the culprit on `line`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
+    /// What this usually means and how to fix it, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// TeX's own excerpt: the source up to the point it stopped (`l.12 …`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Parse-time scratch: a runaway argument's text (to find where it
+    /// started), TeX's excerpt of the line up to the error, and the first
+    /// context line (which ends with an undefined macro's name).
+    #[serde(skip)]
+    runaway: Option<String>,
+    #[serde(skip)]
+    before: Option<String>,
+    #[serde(skip)]
+    top: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+impl Diagnostic {
+    pub fn new(file: impl Into<String>, line: Option<usize>, severity: Severity, message: impl Into<String>) -> Self {
+        Diagnostic { file: file.into(), line, severity, message: message.into(), ..Default::default() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    #[default]
     Error,
     Warning,
     Info,
@@ -34,6 +61,8 @@ pub enum Severity {
 #[derive(Debug)]
 pub struct Compiled {
     pub ok: bool,
+    /// TeX stopped before writing a PDF: `pdf` (if any) is an earlier build's.
+    pub stale: bool,
     pub diagnostics: Vec<Diagnostic>,
     pub pdf: Option<Vec<u8>>,
     pub log: String,
@@ -71,12 +100,8 @@ pub async fn compile(dir: &Path, main: &str, timeout: Duration) -> anyhow::Resul
         Err(_) => {
             return Ok(Compiled {
                 ok: false,
-                diagnostics: vec![Diagnostic {
-                    file: main.into(),
-                    line: None,
-                    severity: Severity::Error,
-                    message: format!("latexmk timed out after {}s", timeout.as_secs()),
-                }],
+                diagnostics: vec![Diagnostic::new(main, None, Severity::Error, format!("latexmk timed out after {}s", timeout.as_secs()))],
+                stale: true,
                 pdf: None,
                 log: String::new(),
                 ms: start.elapsed().as_millis() as u64,
@@ -87,8 +112,12 @@ pub async fn compile(dir: &Path, main: &str, timeout: Duration) -> anyhow::Resul
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "main".into());
-    let log = std::fs::read_to_string(out.join(format!("{stem}.log"))).unwrap_or_default();
+    let log = read_lossy(&out.join(format!("{stem}.log")));
     let mut diagnostics = parse_log(&log, main);
+    let blg = read_lossy(&out.join(format!("{stem}.blg")));
+    diagnostics.extend(parse_blg(&blg));
+    refine(&mut diagnostics, main, |f| std::fs::read_to_string(dir.join(f)).ok(), &tex_files(dir));
+    let stale = log.contains("no output PDF file produced") || log.contains("No pages of output");
     if !output.status.success() && diagnostics.iter().all(|d| d.severity != Severity::Error) {
         // latexmk failed without a TeX error in the log (missing file, bibtex, …): surface its own output.
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -100,38 +129,43 @@ pub async fn compile(dir: &Path, main: &str, timeout: Duration) -> anyhow::Resul
             .take(5)
             .collect::<Vec<_>>()
             .join("\n");
-        diagnostics.push(Diagnostic {
-            file: main.into(),
-            line: None,
-            severity: Severity::Error,
-            message: if tail.is_empty() {
-                format!("latexmk exited with {}", output.status)
-            } else {
-                tail
-            },
-        });
+        diagnostics.push(Diagnostic::new(
+            main,
+            None,
+            Severity::Error,
+            if tail.is_empty() { format!("latexmk exited with {}", output.status) } else { tail },
+        ));
     }
     // A label that recorded an empty number renders as "Figure " — usually a
     // \label placed after a caption that sat inside extra braces. TeX says
     // nothing about it, so look at the .aux ourselves.
-    let aux = std::fs::read_to_string(out.join(format!("{stem}.aux"))).unwrap_or_default();
+    let aux = read_lossy(&out.join(format!("{stem}.aux")));
     for label in empty_labels(&aux) {
         let (file, line) = find_label(dir, main, &label);
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic::new(
             file,
             line,
-            severity: Severity::Warning,
-            message: format!("\\label{{{label}}} recorded an empty number: \\ref will print nothing. It probably follows a \\caption that is wrapped in extra braces — remove them, or put the \\label inside the caption."),
-        });
+            Severity::Warning,
+            format!("\\label{{{label}}} recorded an empty number: \\ref will print nothing. It probably follows a \\caption that is wrapped in extra braces — remove them, or put the \\label inside the caption."),
+        ));
     }
     let pdf = std::fs::read(out.join(format!("{stem}.pdf"))).ok();
     Ok(Compiled {
         ok: output.status.success(),
+        stale,
         diagnostics,
         pdf,
         log,
         ms: start.elapsed().as_millis() as u64,
     })
+}
+
+/// TeX writes 8-bit bytes into its log and aux files as it reads them (a
+/// curly quote in pdflatex input arrives as raw UTF-8 bytes, cut wherever
+/// a line wraps), so they are not always valid UTF-8 — and a strict read
+/// returned nothing, which silently dropped every error of such a project.
+fn read_lossy(path: &Path) -> String {
+    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
 }
 
 pub fn pdf_path(dir: &Path, main: &str) -> PathBuf {
@@ -142,33 +176,25 @@ pub fn pdf_path(dir: &Path, main: &str) -> PathBuf {
 // ---- log parsing ---------------------------------------------------------------
 
 /// Turns a LaTeX log into diagnostics. Errors come from `-file-line-error`
-/// lines (`./file.tex:12: message`) and from `! message` + `l.12`; warnings
-/// from `LaTeX Warning:` / `Package x Warning:` with `on input line N`;
-/// overfull boxes become infos. The current file is tracked through TeX's
-/// parentheses so warnings land in the right file.
+/// lines (`./file.tex:12: message`) and from `! message`; after each, TeX's
+/// context is read up to the `l.12 …` line, which says how far into the line
+/// TeX got (that is where the culprit is) and names an undefined macro.
+/// Warnings come from `LaTeX Warning:` / `Package x Warning:` with `on input
+/// line N`; overfull boxes become infos. The current file is tracked through
+/// TeX's parentheses so warnings land in the right file. `tidy` then drops
+/// what is noise to an author and attaches a plain-words hint; `refine`
+/// (which can read the project) moves errors to where the fix goes.
 pub fn parse_log(log: &str, main: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let mut stack: Vec<String> = vec![main.to_string()];
     let lines: Vec<&str> = log.lines().collect();
     let mut i = 0;
-    let mut pending_error: Option<Diagnostic> = None;
     let mut pending_warning: Option<(Diagnostic, String)> = None;
+    let mut runaway: Option<String> = None;
     let fle = regex::Regex::new(r"^(\./)?([^:\s()]+\.[A-Za-z]+):(\d+): (.*)$").unwrap();
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        track_files(line, &mut stack);
-        let current = || stack.last().cloned().unwrap_or_else(|| main.to_string());
-
-        if let Some(d) = pending_error.as_mut() {
-            if let Some(n) = error_line(line) {
-                d.line = Some(n);
-                out.push(pending_error.take().unwrap());
-                continue;
-            } else if line.is_empty() || line.starts_with('!') {
-                out.push(pending_error.take().unwrap());
-            }
-        }
         if let Some((d, pkg)) = pending_warning.as_mut() {
             let cont = line.strip_prefix(&format!("({pkg})")).map(str::trim);
             match cont {
@@ -186,38 +212,31 @@ pub fn parse_log(log: &str, main: &str) -> Vec<Diagnostic> {
                 }
             }
         }
+        let current = stack.last().cloned().unwrap_or_else(|| main.to_string());
 
-        if let Some(c) = fle.captures(line) {
-            out.push(Diagnostic {
-                file: normalize(&c[2]),
-                line: c[3].parse().ok(),
-                severity: Severity::Error,
-                message: c[4].trim().to_string(),
-            });
-        } else if let Some(msg) = line.strip_prefix("! ") {
-            pending_error = Some(Diagnostic {
-                file: current(),
-                line: None,
-                severity: Severity::Error,
-                message: msg.trim().to_string(),
-            });
-        } else if let Some(msg) = line.strip_prefix("LaTeX Warning: ") {
-            out.push(Diagnostic {
-                file: current(),
-                line: input_line(msg),
-                severity: Severity::Warning,
-                message: msg.trim().to_string(),
-            });
+        let error = if let Some(c) = fle.captures(line) {
+            Some(Diagnostic::new(normalize(&c[2]), c[3].parse().ok(), Severity::Error, c[4].trim()))
+        } else {
+            line.strip_prefix("! ").map(|msg| Diagnostic::new(current.clone(), None, Severity::Error, msg.trim()))
+        };
+        if let Some(mut d) = error {
+            d.runaway = runaway.take();
+            // The context is source text: its parentheses must not reach track_files.
+            i = read_error_context(&lines, i, &mut d, &fle);
+            out.push(d);
+            continue;
+        }
+        if line.starts_with("Runaway ") && line.ends_with('?') {
+            runaway = lines.get(i).map(|s| s.trim().to_string());
+            i += 1;
+            continue;
+        }
+        track_files(line, &mut stack);
+
+        if let Some(msg) = line.strip_prefix("LaTeX Warning: ") {
+            out.push(Diagnostic::new(current, input_line(msg), Severity::Warning, msg.trim()));
         } else if let Some((pkg, msg)) = package_warning(line) {
-            pending_warning = Some((
-                Diagnostic {
-                    file: current(),
-                    line: input_line(&msg),
-                    severity: Severity::Warning,
-                    message: msg,
-                },
-                pkg,
-            ));
+            pending_warning = Some((Diagnostic::new(current, input_line(&msg), Severity::Warning, msg), pkg));
         } else if line.starts_with("Overfull \\hbox") || line.starts_with("Underfull \\hbox") {
             let at = line
                 .split("at lines ")
@@ -225,22 +244,346 @@ pub fn parse_log(log: &str, main: &str) -> Vec<Diagnostic> {
                 .and_then(|s| s.split(['-', ' ']).next())
                 .and_then(|n| n.parse().ok())
                 .or_else(|| line.split("at line ").nth(1).and_then(|s| s.trim().parse().ok()));
-            out.push(Diagnostic {
-                file: current(),
-                line: at,
-                severity: Severity::Info,
-                message: line.trim().to_string(),
-            });
+            out.push(Diagnostic::new(current, at, Severity::Info, line.trim()));
         }
-    }
-    if let Some(d) = pending_error {
-        out.push(d);
     }
     if let Some((d, _)) = pending_warning {
         out.push(d);
     }
+    tidy(out)
+}
+
+/// Reads what TeX prints after an error, through the `l.N …` line and its
+/// continuation (stopping early at the next error): the first context line is
+/// where TeX was — for an undefined macro it ends with the macro — and the
+/// `l.N` line is the source up to the point TeX stopped. Returns the index of
+/// the first line not consumed.
+fn read_error_context(lines: &[&str], mut i: usize, d: &mut Diagnostic, fle: &regex::Regex) -> usize {
+    let start = i;
+    let mut shown: Vec<&str> = Vec::new();
+    while i < lines.len() && i < start + 40 {
+        let l = lines[i];
+        if l.starts_with("! ") || fle.is_match(l) || l.starts_with("Here is how much of TeX's memory") {
+            break;
+        }
+        i += 1;
+        let t = l.trim_end();
+        let boiler = t.is_empty()
+            || t.starts_with("See the LaTeX manual")
+            || t.starts_with("Type  H <return>")
+            || t.starts_with("Type X to quit")
+            || t.starts_with("or enter new name")
+            || t.starts_with("Enter file name");
+        if d.top.is_none() && !boiler && !t.starts_with("<inserted text>") && !t.starts_with("<to be read again>") {
+            d.top = Some(t.trim_start().to_string());
+        }
+        if !boiler && shown.len() < 6 {
+            shown.push(t);
+        }
+        if let Some(n) = error_line(t) {
+            if d.line.is_none() {
+                d.line = Some(n);
+            }
+            d.before = Some(t.split_once(' ').map(|(_, b)| b.to_string()).unwrap_or_default());
+            // The continuation (indented to where the l.N line ended) is the rest of the source line.
+            if let Some(next) = lines.get(i).filter(|n| n.starts_with(' ') || n.is_empty()) {
+                if !next.trim().is_empty() {
+                    shown.push(next.trim_end());
+                }
+                i += 1;
+            }
+            break;
+        }
+    }
+    if let Some(m) = d.message.strip_prefix("LaTeX Error: ") {
+        d.message = m.to_string();
+    }
+    if !shown.is_empty() {
+        d.context = Some(shown.join("\n"));
+    }
+    i
+}
+
+/// Drops what is noise to an author, names undefined macros, and adds hints.
+/// `Emergency stop` follows the error that caused it (which may lack a line,
+/// e.g. a missing `\input` file): its line moves there and it goes. Errors
+/// TeX reports at `\end{document}` after an earlier error are that error's
+/// echo (an unclosed `$` or `{` being closed at the end). Summary warnings
+/// ("There were undefined citations", "… Rerun to get …") repeat the
+/// individual ones, and latexmk reruns by itself.
+fn tidy(all: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    for mut d in all {
+        let is_error = d.severity == Severity::Error;
+        if is_error && d.message.starts_with("==> Fatal error occurred") {
+            continue;
+        }
+        if is_error && d.message == "Emergency stop." {
+            if let Some(prev) = out.iter_mut().rev().find(|p| p.severity == Severity::Error) {
+                if prev.line.is_none() && prev.file == d.file {
+                    prev.line = d.line;
+                    prev.before = d.before.take();
+                    if prev.context.is_none() {
+                        prev.context = d.context.take();
+                    }
+                }
+                continue;
+            }
+            let no_end = d.context.as_deref().is_some_and(|c| c.contains("no legal \\end found"));
+            d.message = if no_end { "The document ended without \\end{document}.".into() } else { "TeX had to stop here.".into() };
+        }
+        if d.severity == Severity::Warning
+            && (d.message.starts_with("There were ")
+                || d.message.contains("Rerun to get")
+                || d.message.starts_with("Label(s) may have changed")
+                || d.message.starts_with("Some images may lack"))
+        {
+            continue;
+        }
+        if is_error
+            && d.before.as_deref().map(str::trim) == Some("\\end{document}")
+            && !d.message.contains("ended by")
+            && out.iter().any(|p| p.severity == Severity::Error)
+        {
+            continue;
+        }
+        if out.iter().any(|p| p.file == d.file && p.line == d.line && p.message == d.message) {
+            continue;
+        }
+        // `\begin{document} ended by \end{theorem}` after `Environment theorem undefined`: the same mistake.
+        if let Some(end) = d.message.split(" ended by \\end{").nth(1).and_then(|r| r.split('}').next())
+            && out.iter().any(|p| p.message == format!("Environment {end} undefined."))
+        {
+            continue;
+        }
+        if d.message.starts_with("Undefined control sequence")
+            && let Some(name) = d.top.as_deref().and_then(trailing_macro)
+        {
+            d.message = format!("Undefined control sequence {name}");
+        }
+        d.hint = hint(&d);
+        out.push(d);
+    }
+    out
+}
+
+/// `\fooo` from `l.2 We use \fooo` or `\x ->\fooo`.
+fn trailing_macro(s: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(\\[A-Za-z@]+\*?|\\.)\s*$").unwrap();
+    re.captures(s).map(|c| c[1].to_string())
+}
+
+/// What the common TeX errors usually mean, in an author's words.
+fn hint(d: &Diagnostic) -> Option<String> {
+    let m = d.message.as_str();
+    let cap = |re: &str| regex::Regex::new(re).unwrap().captures(m).map(|c| c[1].to_string());
+    let s = if m.starts_with("Undefined control sequence") {
+        let name = m.strip_prefix("Undefined control sequence").unwrap().trim();
+        let name = if name.is_empty() { "This command" } else { name };
+        format!("{name} is not defined: check the spelling, or add the \\usepackage or \\newcommand that provides it.")
+    } else if m.starts_with("Missing $ inserted") {
+        "Something that only works in math (_ ^ \\alpha …) is in ordinary text, or a $ is missing. Wrap the math in $…$, or write \\_ for a literal underscore.".into()
+    } else if m.starts_with("File ended while scanning use of") || m.starts_with("Paragraph ended before") {
+        "An argument was never closed: a { is missing its }.".into()
+    } else if m.starts_with("Missing } inserted") || m.starts_with("Too many }'s") || m.starts_with("Extra }, or forgotten") {
+        "The braces don't balance near here: look for an unclosed { or a stray }.".into()
+    } else if m.starts_with("Missing { inserted") {
+        "A command expected a {…} argument here, or math is unbalanced.".into()
+    } else if let Some(env) = cap(r"Environment (\S+) undefined") {
+        format!("Nothing defines the {env} environment: load its package, or define it (e.g. \\newtheorem{{{env}}}{{…}}).")
+    } else if m.contains(" ended by \\end{") {
+        "Every \\begin{…} needs a matching \\end{…}, in the right order.".into()
+    } else if let Some(f) = cap(r"File `([^']+)' not found") {
+        format!("No file {f}: check the name and the folder, or upload it.")
+    } else if m.starts_with("Misplaced alignment tab character &") {
+        "& only separates columns in tables and aligned math; write \\& for an ampersand.".into()
+    } else if m.starts_with("Extra alignment tab") {
+        "This row has more & columns than the table's column spec.".into()
+    } else if m.starts_with("Double superscript") || m.starts_with("Double subscript") {
+        "Group it: x^{a^b} or {x^a}^b.".into()
+    } else if m.starts_with("Illegal parameter number") || m.contains("macro parameter character #") {
+        "# is special in LaTeX; write \\# for the symbol.".into()
+    } else if let Some(c) = cap(r"Command (\\\S+) already defined") {
+        format!("{c} exists already: use \\renewcommand, or pick another name.")
+    } else if m.starts_with("Can be used only in preamble") {
+        "Move this before \\begin{document}.".into()
+    } else if m.starts_with("Missing \\begin{document}") {
+        "There is text (or a stray character) in the preamble, before \\begin{document}.".into()
+    } else if m.starts_with("Not in outer par mode") {
+        "A float (figure/table) or marginpar is inside a box or another float.".into()
+    } else if m.starts_with("Too many unprocessed floats") {
+        "Too many figures/tables are waiting for a place: add \\clearpage, or loosen their [placement].".into()
+    } else if let Some(p) = cap(r"Option clash for package (\S+)") {
+        format!("{p} is loaded twice with different options: load it once, with all of them.")
+    } else if m.starts_with("Display math should end with $$") || m.starts_with("Bad math environment delimiter") {
+        "Math delimiters don't pair up: \\[ with \\], \\( with \\), $$ with $$.".into()
+    } else if m.starts_with("The document ended without") {
+        "Add \\end{document} at the end of the main file.".into()
+    } else if let Some(k) = cap(r"Reference [`'](\S+)' on page \d+ undefined") {
+        format!("No \\label{{{k}}} anywhere: check the spelling (it prints as ??).")
+    } else if let Some(k) = cap(r"Citation [`'](\S+)' on page \d+ undefined") {
+        format!("No bibliography entry {k}: check the key and the .bib file (it prints as [?]).")
+    } else if m.starts_with("Label `") && m.contains("multiply defined") {
+        "Two \\label{…}s have the same name: \\ref will point at one of them at random.".into()
+    } else {
+        return None;
+    };
+    Some(s)
+}
+
+/// BibTeX's and biber's complaints, from the `.blg`: a malformed entry keeps
+/// the bibliography from updating, and the `.log` never says why.
+pub fn parse_blg(blg: &str) -> Vec<Diagnostic> {
+    let bibtex = regex::Regex::new(r"^(.*)---line (\d+) of file (.+)$").unwrap();
+    let biber_at = regex::Regex::new(r"([^/\s]+\.bib)_\d+\.utf8, line (\d+), (.*)$").unwrap();
+    let lines: Vec<&str> = blg.lines().collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(c) = bibtex.captures(l) {
+            let mut msg = c[1].trim().to_string();
+            if msg.is_empty() && i > 0 {
+                msg = lines[i - 1].trim().to_string();
+            }
+            let warning = msg.starts_with("Warning--");
+            let msg = msg.trim_start_matches("Warning--").to_string();
+            let mut d = Diagnostic::new(c[3].trim(), c[2].parse().ok(), if warning { Severity::Warning } else { Severity::Error }, format!("BibTeX: {msg}"));
+            d.hint = Some("This entry in the .bib file is malformed (often a missing comma, brace or quote), so the bibliography is not updating.".into());
+            out.push(d);
+        } else if let Some(m) = l.strip_prefix("I couldn't open database file ") {
+            out.push(Diagnostic::new(m.trim(), None, Severity::Error, format!("BibTeX could not open {}", m.trim())));
+        } else if let Some(m) = l.strip_prefix("ERROR - ") {
+            let mut d = Diagnostic::new("", None, Severity::Error, format!("biber: {}", m.trim()));
+            if let Some(c) = biber_at.captures(m) {
+                d.file = c[1].to_string();
+                d.line = c[2].parse().ok();
+                d.message = format!("biber: {}", c[3].trim());
+            }
+            out.push(d);
+        }
+    }
     out.dedup();
     out
+}
+
+/// Moves errors to where the fix goes, now that the project can be read: a
+/// runaway argument to the command that opened it (TeX reports the place it
+/// gave up, often the `\input` of the file, or the end of the document), an
+/// environment that never closed to its `\begin`, and every error with an
+/// `l.N` excerpt gets the culprit's columns on its line. `files` are the
+/// project's `.tex` files, searched with the diagnostic's own file first.
+pub fn refine(diags: &mut [Diagnostic], main: &str, read: impl Fn(&str) -> Option<String>, files: &[String]) {
+    let texts: Vec<(String, String)> = files.iter().filter_map(|f| read(f).map(|t| (f.clone(), t))).collect();
+    let ordered = |first: &str| {
+        let mut v: Vec<&(String, String)> = texts.iter().collect();
+        v.sort_by_key(|(f, _)| (f != first, f != main));
+        v
+    };
+    let env_re = regex::Regex::new(r"\\begin\{([^}]+)\} on input line (\d+) ended by \\end\{([^}]+)\}").unwrap();
+    for d in diags.iter_mut() {
+        if let Some(r) = d.runaway.clone()
+            && (d.message.starts_with("File ended while scanning use of") || d.message.starts_with("Paragraph ended before"))
+            && let Some((file, line, cols, cmd)) = find_runaway(&ordered(&d.file), &r)
+        {
+            let why = if d.message.starts_with("File") { "it runs to the end of the file" } else { "it runs into a blank line" };
+            d.message = format!("{cmd}{{ is never closed: {why}");
+            d.hint = Some(format!("Add the missing }} to close {cmd}{{…}}."));
+            (d.file, d.line, d.column, d.end_column, d.before) = (file, Some(line), Some(cols.0), Some(cols.1), None);
+        }
+        if let Some(c) = env_re.captures(&d.message.clone()) {
+            let (env, n, end) = (c[1].to_string(), c[2].parse::<usize>().unwrap_or(0), c[3].to_string());
+            let begin = format!("\\begin{{{env}}}");
+            let hit = ordered(&d.file).into_iter().find_map(|(f, t)| {
+                let l = t.lines().nth(n.checked_sub(1)?)?;
+                l.find(&begin).map(|b| (f.clone(), utf16_col(l, b), utf16_col(l, b + begin.len())))
+            });
+            if let Some((file, from, to)) = hit {
+                if end == "document" {
+                    d.message = format!("{begin} is never closed (\\end{{document}} came first)");
+                    d.hint = Some(format!("Add \\end{{{env}}} where the {env} should end."));
+                    (d.file, d.line, d.column, d.end_column, d.before) = (file, Some(n), Some(from), Some(to), None);
+                } else {
+                    d.hint = Some(format!("The {begin} is at {file}:{n}; this \\end{{{end}}} doesn't match it. Every \\begin needs its own \\end, innermost first."));
+                }
+            }
+        }
+        if d.column.is_none()
+            && let (Some(before), Some(n)) = (d.before.as_deref(), d.line)
+            && let Some((_, t)) = texts.iter().find(|(f, _)| *f == d.file)
+            && let Some(l) = t.lines().nth(n.saturating_sub(1))
+            && let Some((a, b)) = culprit_columns(l, before, d.top.as_deref().and_then(trailing_macro).as_deref())
+        {
+            (d.column, d.end_column) = (Some(a), Some(b));
+        }
+    }
+}
+
+/// The `.tex` files of a project, relative to it (private dirs skipped).
+pub fn tex_files(dir: &Path) -> Vec<String> {
+    walkdir::WalkDir::new(dir)
+        .max_depth(6)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .flatten()
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "tex"))
+        .filter_map(|e| e.path().strip_prefix(dir).ok().map(|p| p.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// Where a runaway argument starts: TeX prints its text (`{bold and never
+/// closed. More …`) with its own spacing, so both sides are compared with
+/// whitespace removed. Returns the file, line, the columns of the command
+/// that took the argument (or of the brace), and the command.
+fn find_runaway(texts: &[&(String, String)], runaway: &str, ) -> Option<(String, usize, (usize, usize), String)> {
+    let want: String = runaway.chars().filter(|c| !c.is_whitespace()).take(40).collect();
+    if want.chars().count() < 4 {
+        return None;
+    }
+    for (f, t) in texts {
+        let (squeezed, at): (String, Vec<usize>) = t.char_indices().filter(|(_, c)| !c.is_whitespace()).map(|(i, c)| (c, i)).unzip();
+        let Some(k) = squeezed.find(&want) else { continue };
+        let pos = at[squeezed[..k].chars().count()];
+        // The command just before the brace: `\textbf{`, `\emph*{`.
+        let head = &t[..pos];
+        let cmd_start = head
+            .rfind('\\')
+            .filter(|&b| head[b + 1..].chars().all(|c| c.is_ascii_alphabetic() || c == '@' || c == '*') && b + 1 < head.len());
+        let from = cmd_start.unwrap_or(pos);
+        let cmd = cmd_start.map(|b| head[b..].to_string()).unwrap_or_default();
+        let line_start = t[..from].rfind('\n').map_or(0, |n| n + 1);
+        let line_no = t[..from].matches('\n').count() + 1;
+        let l = t[line_start..].lines().next().unwrap_or("");
+        return Some((f.clone(), line_no, (utf16_col(l, from - line_start), utf16_col(l, pos + 1 - line_start)), cmd));
+    }
+    None
+}
+
+/// Columns of the culprit in `line`, given TeX's excerpt of the line up to
+/// where it stopped (maybe with a leading `...`). The culprit is `token` when
+/// the excerpt ends with it (an undefined macro), else the last word.
+fn culprit_columns(line: &str, before: &str, token: Option<&str>) -> Option<(usize, usize)> {
+    let before = before.strip_prefix("...").unwrap_or(before).trim_end();
+    if before.is_empty() {
+        return None;
+    }
+    let tail_from = before.char_indices().rev().nth(39).map_or(0, |(i, _)| i);
+    let tail = &before[tail_from..];
+    let end = if line.starts_with(before) { before.len() } else { line.find(tail)? + tail.len() };
+    let command = regex::Regex::new(r"\\[A-Za-z@]+\*?(\[[^\]]*\])?\{[^{}]*\}$").unwrap();
+    let piece = match token.filter(|t| before.ends_with(t)) {
+        Some(t) => t.len(),
+        None if command.is_match(before) => before.len() - command.find(before).unwrap().start(),
+        None => {
+            let word = before.rsplit(char::is_whitespace).next().unwrap_or("");
+            word.char_indices().rev().nth(29).map_or(word.len(), |(i, _)| word.len() - i)
+        }
+    };
+    let start = end.checked_sub(piece).filter(|&s| line.is_char_boundary(s))?;
+    Some((utf16_col(line, start), utf16_col(line, end)))
+}
+
+/// 1-based UTF-16 column (Monaco's) of byte offset `b` in `line`.
+fn utf16_col(line: &str, b: usize) -> usize {
+    line[..b.min(line.len())].encode_utf16().count() + 1
 }
 
 /// The `l.12 …` line TeX prints after an error: the line number.
@@ -272,7 +615,8 @@ fn input_line(msg: &str) -> Option<usize> {
 
 /// Pushes every `(./file` and pops every `)` — the convention TeX uses to
 /// show which file it is reading. Message text full of parentheses makes
-/// this a heuristic, which is why errors prefer `-file-line-error` lines.
+/// this a heuristic, which is why errors prefer `-file-line-error` lines
+/// and error context (source text) is never fed through it.
 fn track_files(line: &str, stack: &mut Vec<String>) {
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -811,12 +1155,98 @@ mod tests {
         assert_eq!((w.file.as_str(), w.line, w.severity), ("sub/part.tex", Some(2), Severity::Warning));
         let e = find("Undefined control");
         assert_eq!((e.file.as_str(), e.line, e.severity), ("main.tex", Some(8), Severity::Error));
+        assert_eq!(e.message, "Undefined control sequence \\undefinedmacro");
         let o = find("Overfull");
         assert_eq!((o.line, o.severity), (Some(5), Severity::Info));
         let h = find("Token not allowed");
         assert_eq!((h.file.as_str(), h.line), ("main.tex", Some(9)));
         let m = find("Missing $");
         assert_eq!((m.file.as_str(), m.line), ("main.tex", Some(12)));
+    }
+
+    /// Runs the whole pipeline over a log and an in-memory project.
+    fn diagnose(log: &str, files: &[(&str, &str)]) -> Vec<Diagnostic> {
+        let mut d = parse_log(log, "main.tex");
+        let names: Vec<String> = files.iter().map(|(f, _)| f.to_string()).collect();
+        refine(&mut d, "main.tex", |f| files.iter().find(|(n, _)| *n == f).map(|(_, t)| t.to_string()), &names);
+        d.retain(|d| d.severity != Severity::Info);
+        d
+    }
+
+    const MAIN: &str = "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\section{Intro}\\label{sec:intro}\nHello world.\n\\input{sections/body}\n\\end{document}\n";
+
+    #[test]
+    fn undefined_macro_is_named_and_underlined() {
+        let log = "(./main.tex (./sections/body.tex\n./sections/body.tex:2: Undefined control sequence.\nl.2 We use \\fooo\n                {x} here.\nThe control sequence at the end of the top line\nof your error message was never \\def'ed. If you have\n)";
+        let d = diagnose(log, &[("main.tex", MAIN), ("sections/body.tex", "Some body text here.\nWe use \\fooo{x} here.\n")]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "Undefined control sequence \\fooo");
+        assert_eq!((d[0].file.as_str(), d[0].line, d[0].column, d[0].end_column), ("sections/body.tex", Some(2), Some(8), Some(13)));
+        assert!(d[0].hint.as_deref().unwrap().contains("\\fooo is not defined"));
+        assert!(d[0].context.as_deref().unwrap().contains("{x} here."));
+    }
+
+    #[test]
+    fn runaway_argument_lands_on_the_command_that_opened_it() {
+        // TeX blames the \input line of main.tex; the unclosed brace is in body.tex.
+        let log = "(./main.tex (./sections/body.tex)\nRunaway argument?\n{bold and never closed. More text after. Final line. \n./main.tex:6: File ended while scanning use of \\textbf .\n<inserted text> \n                \\par \nl.6 \\input{sections/body}\n                         \nI suspect you have forgotten a `}', causing me\n)";
+        let body = "Some body text here.\nThis is \\textbf{bold and never closed.\nMore text after.\nFinal line.\n";
+        let d = diagnose(log, &[("main.tex", MAIN), ("sections/body.tex", body)]);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].file.as_str(), d[0].line, d[0].column, d[0].end_column), ("sections/body.tex", Some(2), Some(9), Some(17)));
+        assert_eq!(d[0].message, "\\textbf{ is never closed: it runs to the end of the file");
+    }
+
+    #[test]
+    fn unclosed_environment_points_at_its_begin_and_echoes_go() {
+        let block = |m: &str, ctx: &str| format!("./main.tex:7: {m}\n\nSee the LaTeX manual or LaTeX Companion for explanation.\nType  H <return>  for immediate help.\n{ctx}\nl.7 \\end{{document}}\n                  \nYour command was ignored.\n\n");
+        let log = format!(
+            "(./main.tex (./sections/body.tex)\n\n{}{}./main.tex:7: Missing }} inserted.\n<inserted text> \n                }}\nl.7 \\end{{document}}\n                  \n\n! Emergency stop.\n<*> main.tex\n                \n*** (job aborted, no legal \\end found)\n\nHere is how much of TeX's memory you used:\n 1156 strings out of 476091\n./main.tex:7:  ==> Fatal error occurred, no output PDF file produced!\n",
+            block("LaTeX Error: \\begin{figure} on input line 2 ended by \\end{document}.", " ...urrenvline \\space ended by \\protect \\end {\\detokenize {document}}."),
+            "./main.tex:7: You can't use `\\end' in internal vertical mode.\n\\enddocument ...o \\@@end \n                                                                                                                                                                                                                                              \nl.7 \\end{document}\n                  \n\n"
+        );
+        let d = diagnose(&log, &[("main.tex", MAIN), ("sections/body.tex", "Some body text here.\n\\begin{figure}\\centering x\n")]);
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].message, "\\begin{figure} is never closed (\\end{document} came first)");
+        assert_eq!((d[0].file.as_str(), d[0].line, d[0].column, d[0].end_column), ("sections/body.tex", Some(2), Some(1), Some(15)));
+    }
+
+    #[test]
+    fn missing_file_takes_the_emergency_stops_line() {
+        let log = "(./main.tex (./sections/body.tex\n! LaTeX Error: File `sections/missing.tex' not found.\n\nType X to quit or <RETURN> to proceed,\nor enter new name. (Default extension: tex)\n\nEnter file name: \n./sections/body.tex:2: Emergency stop.\n<read *> \n         \nl.2 \\input{sections/missing}\n                            ^^M\n*** (cannot \\read from terminal in nonstop modes)\n";
+        let d = diagnose(log, &[("main.tex", MAIN), ("sections/body.tex", "Some body text here.\n\\input{sections/missing}\n")]);
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].message, "File `sections/missing.tex' not found.");
+        assert_eq!((d[0].file.as_str(), d[0].line, d[0].column, d[0].end_column), ("sections/body.tex", Some(2), Some(1), Some(25)));
+    }
+
+    #[test]
+    fn math_echo_at_end_of_document_is_dropped() {
+        let log = "(./main.tex (./sections/body.tex\n./sections/body.tex:2: Missing $ inserted.\n<inserted text> \n                $\nl.2 The value x_\n                1 is big.\nI've inserted a begin-math/end-math symbol since I think\n\n)\n./main.tex:7: Missing $ inserted.\n<inserted text> \n                $\nl.7 \\end{document}\n                  \nI've inserted a begin-math/end-math symbol since I think\n\nLaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.\n";
+        let d = diagnose(log, &[("main.tex", MAIN), ("sections/body.tex", "Some body text here.\nThe value x_1 is big.\n")]);
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!((d[0].line, d[0].column, d[0].end_column), (Some(2), Some(11), Some(13)));
+        assert!(d[0].hint.as_deref().unwrap().contains("\\_"));
+    }
+
+    #[test]
+    fn logs_that_are_not_utf8_still_parse() {
+        // pdflatex copies source bytes into the log and wraps lines mid-character.
+        let dir = crate::history::tmp_dir("lossy-log");
+        let mut bytes = b"(./main.tex\nLaTeX Warning: Reference `a' on page 1 undefined on input line 3.\nIt\xe2\x80".to_vec();
+        bytes.extend_from_slice(b"\n./main.tex:5: Undefined control sequence.\nl.5 \\nope\n\n)");
+        let path = dir.join("main.log");
+        std::fs::write(&path, bytes).unwrap();
+        let d = parse_log(&read_lossy(&path), "main.tex");
+        assert!(d.iter().any(|d| d.message == "Undefined control sequence \\nope" && d.line == Some(5)), "{d:#?}");
+    }
+
+    #[test]
+    fn bibtex_errors_point_into_the_bib_file() {
+        let blg = "Database file #1: refs.bib\nI was expecting a `,' or a `}'---line 12 of file refs.bib\n :   title = {foo\n :   \nI'm skipping whatever remains of this entry\nWarning--I didn't find a database entry for \"x\"\n(There was 1 error message)\n";
+        let d = parse_blg(blg);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].file.as_str(), d[0].line, d[0].severity), ("refs.bib", Some(12), Severity::Error));
     }
 
     #[test]
@@ -833,3 +1263,4 @@ mod tests {
         assert_eq!(parse_inverse("nothing", Path::new("/p")), None);
     }
 }
+

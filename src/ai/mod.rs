@@ -772,7 +772,13 @@ fn context_block(ctx: &Context, ws: &Workspace, diags: &[Diagnostic]) -> String 
     } else {
         s.push_str(&format!("Last compile: {} error(s), {warnings} warning(s)\n", errors.len()));
         for d in errors.iter().take(10) {
-            s.push_str(&format!("  - {}:{}: {}\n", d.file, d.line.unwrap_or(0), d.message));
+            s.push_str(&format!("  - {}:{}{}: {}\n", d.file, d.line.unwrap_or(0), d.column.map(|c| format!(":{c}")).unwrap_or_default(), d.message));
+            if let Some(h) = &d.hint {
+                s.push_str(&format!("    hint: {h}\n"));
+            }
+            if let Some(c) = &d.context {
+                s.push_str(&format!("    TeX's context:\n      {}\n", c.replace('\n', "\n      ")));
+            }
         }
     }
     if let Some(file) = &ctx.file

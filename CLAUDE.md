@@ -127,6 +127,19 @@ the working notes for changing the code. **Keep both in sync with reality.**
 
 - latexmk exits non-zero on TeX errors but still writes a PDF in
   nonstopmode; `Compiled.ok` is the exit status, `pdf` is what's on disk.
+- **TeX logs are not UTF-8.** pdflatex copies source bytes into the log and
+  wraps lines mid-character; `build::read_lossy` reads `.log`/`.blg`/`.aux`.
+  A strict `read_to_string` once returned an error → empty log → *no*
+  diagnostics at all for any paper with a curly quote in it.
+- Diagnostics are three passes: `parse_log` (reads TeX's context after each
+  error up to `l.N`, which is never fed to `track_files`), `tidy` (drops echo
+  errors and summary warnings, names undefined macros, hints), and `refine`
+  (reads the project: runaway arguments and unclosed environments move to
+  where they started; columns from the `l.N` excerpt). Each case has a test
+  built from a real log; add one when a new error shape turns up.
+- `Compiled.stale`: TeX stopped before writing a PDF ("no output PDF file
+  produced"), so the `main.pdf` on disk is an earlier build's. It must never
+  count as a new version or be cached as a history version's PDF.
 - The log's file stack (`track_files`) is a heuristic — parentheses in
   messages confuse it. Errors come from `-file-line-error` lines, which
   carry their own file, so only warnings can be misattributed.
