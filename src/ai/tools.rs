@@ -11,6 +11,9 @@ use std::time::Duration;
 
 pub struct Workspace {
     pub dir: PathBuf,
+    /// The live project this is a copy of — only ever *read* (its git history,
+    /// for `list_commits` / `restore_commit`), never written.
+    pub project: PathBuf,
     pub latex_timeout: Duration,
 }
 
@@ -34,6 +37,14 @@ impl Workspace {
         let full = self.dir.join(path);
         std::fs::create_dir_all(full.parent().unwrap())?;
         Ok(std::fs::write(full, text)?)
+    }
+
+    /// Removes a text file from the copy; the proposal then deletes it.
+    pub fn remove(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(project::valid_path(path) && project::is_text(path), "not a text file path");
+        let full = self.dir.join(path);
+        anyhow::ensure!(full.is_file(), "{path} does not exist");
+        Ok(std::fs::remove_file(full)?)
     }
 
     /// Current texts of every text file, for diffing against the base.
@@ -88,7 +99,7 @@ pub fn make_workspace(
             }
         }
     }
-    Ok(Workspace { dir: dir.to_path_buf(), latex_timeout })
+    Ok(Workspace { dir: dir.to_path_buf(), project: project_dir.to_path_buf(), latex_timeout })
 }
 
 #[cfg(test)]

@@ -38,8 +38,12 @@ the working notes for changing the code. **Keep both in sync with reality.**
   after a whitespace edit does not.
 - **The AI never touches the live project during a run.** It works in
   `.kloverleaf/ai/<session>/` (`tools::make_workspace`); the proposal is the
-  diff between that copy's text files and the session's base. Apply goes
-  through `replace` with `kind = "ai"` and the prompt in `meta`, then commits.
+  diff between that copy's text files and the session's base (a base file
+  missing from the copy is a `deleted` proposal, applied as `delete_file`).
+  Apply goes through `replace` with `kind = "ai"` and the prompt in `meta`,
+  then commits. `Workspace.project` is the live directory, only ever *read*
+  (git: `list_commits`, `restore_commit` via `gitd::texts_at` /
+  `upstream::texts_at`, which skip `.gitignore` — the app's, not content).
 - **The agent is a subprocess, never an HTTP client.** `ai/claude.rs` spawns
   `claude -p --output-format stream-json` with `--strict-mcp-config` pointing
   at our own `/mcp` and every built-in file/shell tool disallowed;

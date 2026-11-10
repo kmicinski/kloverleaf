@@ -8,6 +8,7 @@
 //! protocol is spoken by spawning `git upload-pack` / `git receive-pack`
 //! with `--stateless-rpc`, which is exactly what `git-http-backend` does.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -104,10 +105,19 @@ pub struct Commit {
     pub ts: i64,
     pub author: String,
     pub message: String,
+    /// The author date as git prints it, with its time zone.
+    pub date: String,
 }
 
 pub async fn log(dir: &Path, n: usize) -> anyhow::Result<Vec<Commit>> {
-    let out = git(dir, &["log", &format!("-{n}"), "--format=%H%x1f%at%x1f%an%x1f%s"]).await?;
+    log_of(dir, &["log", &format!("-{n}")]).await
+}
+
+/// `git log` with its own arguments (a ref, `--grep`, `-- path`), parsed.
+pub async fn log_of(dir: &Path, args: &[&str]) -> anyhow::Result<Vec<Commit>> {
+    let mut all = args.to_vec();
+    all.insert(1, "--format=%H%x1f%at%x1f%an%x1f%s%x1f%ai");
+    let out = git(dir, &all).await?;
     Ok(out
         .lines()
         .filter_map(|l| {
@@ -117,9 +127,30 @@ pub async fn log(dir: &Path, n: usize) -> anyhow::Result<Vec<Commit>> {
                 ts: it.next()?.parse().ok()?,
                 author: it.next()?.to_string(),
                 message: it.next().unwrap_or("").to_string(),
+                date: it.next().unwrap_or("").to_string(),
             })
         })
         .collect())
+}
+
+/// A revision the agent named: a hex id or a ref-ish name, never an option.
+pub fn plain_rev(rev: &str) -> bool {
+    !rev.is_empty() && !rev.starts_with('-') && rev.chars().all(|c| c.is_ascii_alphanumeric() || "._/~^-".contains(c))
+}
+
+/// Every text file of commit `rev` in the project's own repository (path →
+/// text), with the commit's full id. `.gitignore` is the app's, not content.
+pub async fn texts_at(dir: &Path, rev: &str) -> anyhow::Result<(String, BTreeMap<String, String>)> {
+    anyhow::ensure!(plain_rev(rev), "not a commit name: {rev}");
+    let sha = git(dir, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]).await?.trim().to_string();
+    let mut files = BTreeMap::new();
+    for path in git(dir, &["ls-tree", "-r", "-z", "--name-only", &sha]).await?.split('\0') {
+        if path.is_empty() || path == ".gitignore" || !crate::project::valid_path(path) || !crate::project::is_text(path) {
+            continue;
+        }
+        files.insert(path.to_string(), git(dir, &["show", &format!("{sha}:{path}")]).await?);
+    }
+    Ok((sha, files))
 }
 
 // ---- smart HTTP ------------------------------------------------------------------

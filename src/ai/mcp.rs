@@ -79,6 +79,22 @@ pub fn catalog() -> Vec<Value> {
                    "edits": {"type": "array", "minItems": 1,
                              "items": schema(json!({"old": {"type": "string"}, "new": {"type": "string"}}), &["old", "new"])}
                }), &["path", "edits"])}),
+        json!({"name": "delete_file",
+               "description": "Delete a text file from the project (the proposal shows it as removed).",
+               "inputSchema": schema(json!({"path": {"type": "string"}}), &["path"])}),
+        json!({"name": "list_commits",
+               "description": "The project's commits, newest first: id, date, author, message. Without `upstream`, the project's own history (kloverleaf commits: AI applies, pulls, pushes, manual commits; add `autosaves` to include the 30-second autosaves). With `upstream: true`, the history of the GitHub repository the project tracks (only commits touching its directory). Use this to find the commit to give `restore_commit`.",
+               "inputSchema": schema(json!({
+                   "upstream": {"type": "boolean"},
+                   "autosaves": {"type": "boolean"},
+                   "n": {"type": "integer", "minimum": 1, "maximum": 300, "description": "How many (default 40)"}
+               }), &[])}),
+        json!({"name": "restore_commit",
+               "description": "Go back to a commit: make the project's text files exactly what they were at `commit` (an id or unique prefix from list_commits, from the project's history or the tracked GitHub repository). Files the commit has are written, files it lacks are deleted. Give `paths` to restore only those files. Binary files (images, PDFs) are left alone. Like every edit, this only changes your copy; the author reviews the result as a proposal.",
+               "inputSchema": schema(json!({
+                   "commit": {"type": "string"},
+                   "paths": {"type": "array", "items": {"type": "string"}}
+               }), &["commit"])}),
         json!({"name": "compile",
                "description": "Run latexmk on the project and return whether it succeeded and the diagnostics (file, line, severity, message). Do this after editing to check your work.",
                "inputSchema": schema(json!({}), &[])}),
@@ -171,6 +187,73 @@ pub async fn execute(ws: &Workspace, name: &str, input: &Value) -> Result<Reply,
             }
             ws.write(&path, &t).map_err(|e| format!("{e:#}"))?;
             text(format!("wrote {path} ({} lines)", t.lines().count()), format!("edited {path} ({} edit(s))", edits.len()))
+        }
+        "delete_file" => {
+            let path = s("path").ok_or("path is required")?;
+            ws.remove(&path).map_err(|e| format!("{e:#}"))?;
+            text(format!("deleted {path}"), format!("deleted {path}"))
+        }
+        "list_commits" => {
+            let n = n("n").unwrap_or(40).clamp(1, 300);
+            let upstream = input["upstream"].as_bool().unwrap_or(false);
+            let commits = if upstream {
+                crate::upstream::log(&ws.project, n).await
+            } else if input["autosaves"].as_bool().unwrap_or(false) {
+                crate::gitd::log(&ws.project, n).await
+            } else {
+                let count = format!("-{n}");
+                crate::gitd::log_of(&ws.project, &["log", &count, "--invert-grep", "--grep=^autosave$"]).await
+            }
+            .map_err(|e| format!("{e:#}"))?;
+            let lines: Vec<String> = commits
+                .iter()
+                .map(|c| {
+                    format!("{}  {}  {}  {}", &c.sha[..c.sha.len().min(10)], c.date, c.author, c.message)
+                })
+                .collect();
+            let which = if upstream { "upstream" } else { "project" };
+            text(if lines.is_empty() { "no commits".into() } else { lines.join("\n") }, format!("listed {} {which} commit(s)", lines.len()))
+        }
+        "restore_commit" => {
+            let rev = s("commit").ok_or("commit is required")?;
+            let (sha, from, then) = match crate::gitd::texts_at(&ws.project, &rev).await {
+                Ok((sha, t)) => (sha, "project", t),
+                Err(local) => match crate::upstream::texts_at(&ws.project, &rev).await {
+                    Ok((sha, t)) => (sha, "upstream", t),
+                    Err(_) => return Err(format!("no commit {rev} in the project's history or the tracked repository ({local:#}); list_commits shows what exists")),
+                },
+            };
+            let now = ws.texts();
+            let only: Option<Vec<String>> = input["paths"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            let wanted = |p: &str| only.as_ref().is_none_or(|o| o.iter().any(|x| x == p));
+            let (mut written, mut removed) = (Vec::new(), Vec::new());
+            for (path, t) in &then {
+                if wanted(path) && now.get(path) != Some(t) {
+                    ws.write(path, t).map_err(|e| format!("{e:#}"))?;
+                    written.push(path.clone());
+                }
+            }
+            for path in now.keys() {
+                if wanted(path) && !then.contains_key(path) && path != ".gitignore" {
+                    ws.remove(path).map_err(|e| format!("{e:#}"))?;
+                    removed.push(path.clone());
+                }
+            }
+            if let Some(o) = &only {
+                let missing: Vec<&String> = o.iter().filter(|p| !then.contains_key(*p) && !now.contains_key(*p)).collect();
+                if !missing.is_empty() {
+                    return Err(format!("not in commit {sha:.10} nor the project: {missing:?}"));
+                }
+            }
+            let short = &sha[..10];
+            let mut out = format!("restored {from} commit {short}: {} file(s) written, {} deleted", written.len(), removed.len());
+            for p in &written {
+                out.push_str(&format!("\n  wrote {p}"));
+            }
+            for p in &removed {
+                out.push_str(&format!("\n  deleted {p}"));
+            }
+            text(out, format!("restored {short}: {} written, {} deleted", written.len(), removed.len()))
         }
         "compile" => {
             let main = ws.main().ok_or("no main .tex file")?;
@@ -298,7 +381,7 @@ mod tests {
     fn ws() -> Workspace {
         let dir = crate::history::tmp_dir("mcp");
         std::fs::write(dir.join("main.tex"), "\\documentclass{article}\n\\begin{document}\nHello\nHello\n\\end{document}\n").unwrap();
-        Workspace { dir, latex_timeout: Duration::from_secs(30) }
+        Workspace { project: dir.clone(), dir, latex_timeout: Duration::from_secs(30) }
     }
 
     #[tokio::test]

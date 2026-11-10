@@ -587,16 +587,20 @@ pub struct ApplyBody {
 #[derive(Deserialize)]
 pub struct FileText {
     path: String,
+    #[serde(default)]
     text: String,
+    /// Delete the file instead (a proposal that removes it).
+    #[serde(default)]
+    delete: bool,
 }
 
 pub async fn ai_apply(State(app): State<Shared>, Path((p, id)): Path<(String, u64)>, body: Option<Json<ApplyBody>>) -> ApiResult<Json<Value>> {
     let pr = project(&app, &p)?;
     app.ai.remember(&pr);
     let s = app.ai.session(&p, id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
-    let files: Vec<(String, String)> = match body.and_then(|b| b.0.files) {
-        Some(files) => files.into_iter().map(|f| (f.path, f.text)).collect(),
-        None => app.ai.proposal(&s).into_iter().map(|f| (f.path, f.after)).collect(),
+    let files: Vec<(String, Option<String>)> = match body.and_then(|b| b.0.files) {
+        Some(files) => files.into_iter().map(|f| (f.path, (!f.delete).then_some(f.text))).collect(),
+        None => app.ai.proposal(&s).into_iter().map(|f| (f.path, (!f.deleted).then_some(f.after))).collect(),
     };
     let applied = app.ai.apply(&s, files).await.map_err(bad(StatusCode::CONFLICT))?;
     Ok(Json(json!({"applied": applied})))

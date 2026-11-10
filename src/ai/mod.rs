@@ -379,6 +379,9 @@ pub struct ProposedFile {
     pub path: String,
     pub before: String,
     pub after: String,
+    /// The agent removed the file (`after` is empty).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -552,7 +555,7 @@ impl Ai {
             return None;
         }
         let base: BTreeMap<String, String> = std::fs::read_to_string(base_file(&p, id)).ok().and_then(|s| serde_json::from_str(&s).ok())?;
-        let ws = Workspace { dir, latex_timeout: self.latex_timeout };
+        let ws = Workspace { dir, project: p.dir.clone(), latex_timeout: self.latex_timeout };
         let s = Arc::new(Session::new(id, p, &t, ws, base, log));
         self.sessions.lock().unwrap().insert((project.to_string(), id), s.clone());
         Some(s)
@@ -679,18 +682,26 @@ impl Ai {
 
     /// The workspace's text files that differ from the session's base.
     pub fn proposal(&self, s: &Session) -> Vec<ProposedFile> {
+        let now = s.ws.texts();
         let mut out = Vec::new();
-        for (path, after) in s.ws.texts() {
-            let before = s.base.get(&path).cloned().unwrap_or_default();
-            if before != after {
-                out.push(ProposedFile { path, before, after });
+        for (path, after) in &now {
+            let before = s.base.get(path).cloned().unwrap_or_default();
+            if before != *after {
+                out.push(ProposedFile { path: path.clone(), before, after: after.clone(), deleted: false });
             }
         }
+        for (path, before) in &s.base {
+            if !now.contains_key(path) {
+                out.push(ProposedFile { path: path.clone(), before: before.clone(), after: String::new(), deleted: true });
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
         out
     }
 
-    /// Applies (possibly hand-edited) proposed files to the live project, commits, ends the session.
-    pub async fn apply(&self, s: &Session, files: Vec<(String, String)>) -> anyhow::Result<Vec<String>> {
+    /// Applies (possibly hand-edited) proposed files to the live project,
+    /// commits, ends the session. A `None` text deletes the file.
+    pub async fn apply(&self, s: &Session, files: Vec<(String, Option<String>)>) -> anyhow::Result<Vec<String>> {
         anyhow::ensure!(s.project.take_lock(&s.user, false), "someone else holds the edit lock");
         let model = s.model.lock().unwrap().clone();
         let mut applied = Vec::new();
@@ -698,7 +709,11 @@ impl Ai {
             // `base` is the entry this file was at when the AI read it — what
             // the prompt addressed; provenance hovers can travel back to it.
             let meta = json!({"session": s.id, "prompt": s.prompt, "model": model, "base": s.base_heads.get(&path)});
-            s.project.replace(&path, text, 0, &s.user, "ai", meta)?;
+            match text {
+                Some(text) => s.project.replace(&path, text, 0, &s.user, "ai", meta)?,
+                None if s.project.text(&path).is_some() => s.project.delete_file(&path, &s.user)?,
+                None => continue,
+            }
             applied.push(path);
         }
         s.project.flush();
@@ -792,7 +807,7 @@ fn context_block(ctx: &Context, ws: &Workspace, diags: &[Diagnostic]) -> String 
 
 const SYSTEM: &str = "You are the writing assistant inside kloverleaf, a LaTeX editor. The author is working on the document in front of them and has asked you for something; the message tells you where they are (cursor, selection, regions they queued for you, the last place they clicked in the PDF) and how the last compile went.
 
-You work on a scratch copy of the project through the kloverleaf tools — they are the only way to see or change it. Read what you need (read_file, search_files), make the edits with write_edits (exact, unique `old` strings — read first, then copy exactly), compile to check, and view_pdf_page when layout, figures or math matter. The author will review your changes as a diff before anything is applied, so be decisive: do the work rather than describing it or asking permission. Keep the author's voice, macros and conventions; change what was asked and what is clearly needed to make it work, not more. Use web search when you need a citation, a package's syntax, or a fact. If the request is ambiguous in a way that matters, pick the reasonable reading and say what you assumed.
+You work on a scratch copy of the project through the kloverleaf tools — they are the only way to see or change it. Read what you need (read_file, search_files), make the edits with write_edits (exact, unique `old` strings — read first, then copy exactly), compile to check, and view_pdf_page when layout, figures or math matter. To go back to an earlier version (\"undo that\", \"revert to commit 1a2b3c\", \"what we had yesterday\"), find it with list_commits (upstream: true for the GitHub repository's commits) and call restore_commit, for the whole project or just `paths`; delete_file removes a file. The author will review your changes as a diff before anything is applied, so be decisive: do the work rather than describing it or asking permission. Keep the author's voice, macros and conventions; change what was asked and what is clearly needed to make it work, not more. Use web search when you need a citation, a package's syntax, or a fact. If the request is ambiguous in a way that matters, pick the reasonable reading and say what you assumed.
 
 When you are done, reply briefly in plain prose: what you changed and why, anything you could not do, and anything the author should check.";
 
@@ -853,11 +868,17 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
                 emit(json!({"event": "error", "message": "no such session"}));
                 return;
             };
-            let files: Vec<(String, String)> = v["files"]
+            let files: Vec<(String, Option<String>)> = v["files"]
                 .as_array()
                 .map(|a| {
                     a.iter()
-                        .filter_map(|f| Some((f["path"].as_str()?.to_string(), f["text"].as_str()?.to_string())))
+                        .filter_map(|f| {
+                            let path = f["path"].as_str()?.to_string();
+                            if f["delete"].as_bool() == Some(true) {
+                                return Some((path, None));
+                            }
+                            Some((path, Some(f["text"].as_str()?.to_string())))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -942,7 +963,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
         assert_eq!(o.files.len(), 1);
         assert!(o.files[0].after.contains("Public sentence."));
         assert!(p.text("main.tex").unwrap().contains("SECRET"), "nothing applied yet");
-        let files = o.files.iter().map(|f| (f.path.clone(), f.after.clone())).collect();
+        let files = o.files.iter().map(|f| (f.path.clone(), Some(f.after.clone()))).collect();
         ai.apply(&s, files).await.unwrap();
         assert!(p.text("main.tex").unwrap().contains("Public sentence."));
         assert!(ai.session(&p.name, s.id).is_none());
@@ -951,6 +972,37 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
         assert_eq!(head.kind, "ai");
         assert_eq!(head.meta["prompt"], "make it public");
         assert_eq!(head.meta["model"], "claude-test");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_commit_goes_back_and_deletes_what_came_later() {
+        let (root, p) = project().await;
+        p.flush();
+        let sha = crate::gitd::commit(&p.dir, "the good version", Some("kris")).await.unwrap().unwrap();
+        p.replace("main.tex", "\\documentclass{article}\n\\begin{document}\nRewritten.\n\\end{document}\n".into(), 0, "kris", "ai", json!({})).unwrap();
+        p.replace("extra.tex", "added later\n".into(), 0, "kris", "ai", json!({})).unwrap();
+        p.flush();
+        crate::gitd::commit(&p.dir, "the bad version", Some("kris")).await.unwrap();
+        let catalog = fake_claude(&root, "true");
+        let ai = Ai::new(catalog, Duration::from_secs(30), 7200);
+        let pick = ai.catalog.resolve(&ChoiceReq::default()).unwrap();
+        let s = ai.new_session(p.clone(), "kris", "go back", pick).unwrap();
+        let log = mcp::execute(&s.ws, "list_commits", &json!({})).await.unwrap();
+        let text = log.content[0]["text"].as_str().unwrap().to_string();
+        assert!(text.contains("the good version") && text.contains("the bad version"), "{text}");
+        assert!(mcp::execute(&s.ws, "restore_commit", &json!({"commit": "--help"})).await.is_err());
+        assert!(mcp::execute(&s.ws, "restore_commit", &json!({"commit": "deadbeef"})).await.is_err());
+        let r = mcp::execute(&s.ws, "restore_commit", &json!({"commit": &sha[..8]})).await.unwrap();
+        assert_eq!(r.summary, format!("restored {}: 1 written, 1 deleted", &sha[..10]));
+        let files = ai.proposal(&s);
+        assert_eq!(files.len(), 2);
+        assert!(files[0].deleted && files[0].path == "extra.tex");
+        assert!(!files[1].deleted && files[1].after.contains("SECRET sentence."));
+        let picks = files.iter().map(|f| (f.path.clone(), (!f.deleted).then(|| f.after.clone()))).collect();
+        ai.apply(&s, picks).await.unwrap();
+        assert!(p.text("main.tex").unwrap().contains("SECRET sentence."));
+        assert!(p.text("extra.tex").is_none() && !p.dir.join("extra.tex").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -981,7 +1033,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
     fn context_mentions_everything_the_author_pointed_at() {
         let dir = crate::history::tmp_dir("ctx");
         std::fs::write(dir.join("main.tex"), "a\nb\nc\n").unwrap();
-        let ws = Workspace { dir: dir.clone(), latex_timeout: Duration::from_secs(1) };
+        let ws = Workspace { dir: dir.clone(), project: dir.clone(), latex_timeout: Duration::from_secs(1) };
         let ctx = Context {
             file: Some("main.tex".into()),
             line: Some(2),

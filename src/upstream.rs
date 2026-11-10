@@ -707,6 +707,34 @@ pub async fn import(dir: &Path, src: &Source, branch: &str, subdir: &str, local_
     Ok((cfg, files.len()))
 }
 
+/// The tracked branch's history touching `subdir`, newest first (as of the last fetch).
+pub async fn log(dir: &Path, n: usize) -> anyhow::Result<Vec<crate::gitd::Commit>> {
+    let cfg = load(dir).ok_or_else(|| anyhow::anyhow!("this project does not track a repository"))?;
+    let (count, rev) = (format!("-{n}"), origin_ref(&cfg.branch));
+    let mut args = vec!["log", count.as_str(), rev.as_str()];
+    if !cfg.subdir.is_empty() {
+        args.extend(["--", cfg.subdir.as_str()]);
+    }
+    crate::gitd::log_of(&private(dir).join(MIRROR), &args).await
+}
+
+/// Every text file of the project's directory at upstream commit `rev`, with
+/// the commit's full id — what a pull of that commit would have given.
+pub async fn texts_at(dir: &Path, rev: &str) -> anyhow::Result<(String, BTreeMap<String, String>)> {
+    anyhow::ensure!(crate::gitd::plain_rev(rev), "not a commit name: {rev}");
+    let cfg = load(dir).ok_or_else(|| anyhow::anyhow!("this project does not track a repository"))?;
+    let mirror = private(dir).join(MIRROR);
+    let sha = rev_parse(&mirror, rev).await?;
+    anyhow::ensure!(!sha.is_empty(), "no commit {rev} upstream");
+    let files = snapshot(&mirror, &sha, &cfg.subdir)
+        .await?
+        .into_iter()
+        .filter(|(p, _)| p != ".gitignore" && project::is_text(p))
+        .filter_map(|(p, b)| Some((p, String::from_utf8(b).ok()?)))
+        .collect();
+    Ok((sha, files))
+}
+
 pub fn label(cfg: &Config) -> String {
     let repo = cfg
         .web

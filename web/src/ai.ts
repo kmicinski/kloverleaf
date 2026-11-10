@@ -8,7 +8,7 @@
 // selection, PDF click, queued regions with notes). Follow-ups continue the
 // same session. Protocol in src/ai/mod.rs.
 
-import type { AiChoice, AiEvent, AiMode, ClientMsg, Context, PdfClick, ProposedFile, Region } from "./protocol.js";
+import type { AiChoice, AiEvent, ApplyFile, AiMode, ClientMsg, Context, PdfClick, ProposedFile, Region } from "./protocol.js";
 import { api, me, when } from "./protocol.js";
 
 /** A conversation as the server lists it (see /api/projects/<p>/ai/threads). */
@@ -64,7 +64,13 @@ let session: number | undefined;
 let running = false;
 let run: RunRow | undefined;
 let proposalEl: HTMLElement | undefined;
-let diffEditors: { path: string; editor: monaco.editor.IStandaloneDiffEditor }[] = [];
+let diffEditors: { path: string; deleted: boolean; editor: monaco.editor.IStandaloneDiffEditor }[] = [];
+
+/** What applying one card sends: a removed file stays removed unless its text was typed back in. */
+function picked(d: { path: string; deleted: boolean; editor: monaco.editor.IStandaloneDiffEditor }): ApplyFile {
+  const text = d.editor.getModel()!.modified.getValue();
+  return d.deleted && text === "" ? { path: d.path, text, delete: true } : { path: d.path, text };
+}
 
 export function initAi(h: AiHost): void {
   host = h;
@@ -502,7 +508,7 @@ function clearProposal(): void {
   barEl.hidden = true;
 }
 
-function apply(files: { path: string; text: string }[]): void {
+function apply(files: ApplyFile[]): void {
   if (session === undefined || running) return;
   host.send({ type: "ai", action: "apply", session, files });
 }
@@ -546,10 +552,10 @@ function showProposal(files: ProposedFile[], draft = false): void {
     name.className = "name";
     name.textContent = f.path;
     head.appendChild(name);
-    if (f.before === "") {
+    if (f.deleted || f.before === "") {
       const badge = document.createElement("span");
-      badge.className = "badge";
-      badge.textContent = "new";
+      badge.className = f.deleted ? "badge deleted" : "badge";
+      badge.textContent = f.deleted ? "deleted" : "new";
       head.appendChild(badge);
     }
     const spacer = document.createElement("span");
@@ -577,7 +583,8 @@ function showProposal(files: ProposedFile[], draft = false): void {
       diffWordWrap: "on", hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     });
     editor.setModel({ original, modified });
-    diffEditors.push({ path: f.path, editor });
+    const entry = { path: f.path, deleted: !!f.deleted, editor };
+    diffEditors.push(entry);
     // Size the box to its content, up to ~45vh; the thread scrolls past it.
     const fit = () => {
       const h = editor.getModifiedEditor().getContentHeight() + 6;
@@ -585,7 +592,7 @@ function showProposal(files: ProposedFile[], draft = false): void {
     };
     editor.getModifiedEditor().onDidContentSizeChange(fit);
     fit();
-    head.appendChild(button("apply this file", "small", () => apply([{ path: f.path, text: editor.getModel()!.modified.getValue() }])));
+    head.appendChild(button(f.deleted ? "delete this file" : "apply this file", "small", () => apply([picked(entry)])));
   }
   append(wrap);
 
@@ -596,7 +603,7 @@ function showProposal(files: ProposedFile[], draft = false): void {
     hint.className = "muted";
     hint.textContent = "edit the diff, or ask a follow-up below";
     barEl.append(
-      button("apply all", "", () => apply(diffEditors.map((d) => ({ path: d.path, text: d.editor.getModel()!.modified.getValue() })))),
+      button("apply all", "", () => apply(diffEditors.map(picked))),
       button("discard", "small", discard),
       hint,
     );

@@ -248,8 +248,12 @@ cursor, the selection, regions you queued (select text, ⌘⇧Q, optionally with
 a note each), the last place you clicked in the PDF (mapped to a source line
 by SyncTeX), and the last compile's errors. It works on a scratch copy of the
 project with these tools: list, read and search files, make exact
-replacements, compile, look at a PDF page as an image, read the PDF's text,
-plus the CLI's own web search and fetch. When it
+replacements, delete a file, compile, look at a PDF page as an image, read
+the PDF's text, list the commits (the project's own, or the tracked GitHub
+repository's) and restore a commit — "go back to 1a2b3c" or "undo the last AI
+change" sets the copy's text files to that commit, deleting what came later;
+binary files stay as they are — plus the CLI's own web search and fetch.
+Removed files show as *deleted* cards in the proposal. When it
 finishes you get a diff per file in an editable diff editor; apply it, edit
 it first, ask a follow-up in the same session, or discard. Applying goes
 through the live document (so it needs the lock), is recorded in the history

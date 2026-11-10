@@ -42,7 +42,9 @@ export type ServerMsg =
 export interface Region { file: string; from: number; to: number; text: string; note?: string }
 export interface PdfClick { page: number; x: number; y: number; file?: string; line?: number }
 export interface Context { file?: string; line?: number; column?: number; selection?: Region; queue: Region[]; pdf?: PdfClick }
-export interface ProposedFile { path: string; before: string; after: string }
+/** `deleted`: the agent removed the file (`after` is ""). */
+export interface ProposedFile { path: string; before: string; after: string; deleted?: boolean }
+export interface ApplyFile { path: string; text: string; delete?: boolean }
 
 export type AiEvent = { session?: number; user: string } & (
   | { event: "started"; prompt: string; mode: AiMode; choice?: AiChoice }
@@ -64,7 +66,7 @@ export type ClientMsg =
   | { type: "ping" }
   | { type: "lock"; action: "take" | "steal" | "release" }
   | { type: "ai"; action: "run"; prompt: string; context: Context; session?: number; provider?: "claude" | "codex"; model?: string; effort?: string }
-  | { type: "ai"; action: "apply"; session: number; files: { path: string; text: string }[] }
+  | { type: "ai"; action: "apply"; session: number; files: ApplyFile[] }
   | { type: "ai"; action: "discard" | "cancel"; session: number };
 
 /** 32-bit FNV-1a over code points; must match `fnv1a` in src/text.rs. */
