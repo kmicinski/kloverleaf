@@ -12,7 +12,12 @@ export interface Diagnostic {
   column?: number; end_column?: number; hint?: string; context?: string;
 }
 /** A page with the project open: its connection, who, and the file it shows. */
-export interface Here { id: number; user: string; file: string | null }
+export interface Here { id: number; user: string; file: string | null; line?: number | null; column?: number | null }
+/** A point in the PDF (points, top-left origin). */
+export interface SyncSpot { page: number; x: number; y: number }
+/** Where a comment is pinned: a line (and its text then, to find it again), maybe the PDF click it came from. */
+export interface ChatAnchor { file: string; line: number; quote: string; pdf?: SyncSpot }
+export interface ChatMsg { id: number; user: string; ts: number; text: string; anchor?: ChatAnchor; resolved: boolean; resolved_by?: string; deleted?: boolean }
 /** `stale`: this compile stopped before writing a PDF; the one shown is an earlier build's. */
 export interface Build { version: number; ok: boolean; diags: Diagnostic[]; ms: number; pdf: boolean; hasPdf: boolean; stale?: boolean }
 export interface Origin { id: number; kind: string; user: string; ts: number; meta: Record<string, unknown> }
@@ -23,13 +28,15 @@ export interface AiProvider { id: "claude" | "codex"; label: string; models: str
 export interface AiMode { mode: "off" | "on"; reason?: string; default?: AiChoice; providers?: AiProvider[]; unavailable?: Record<string, string> }
 
 export type ServerMsg =
-  | { type: "init"; user: string; files: FileInfo[]; main: string | null; here: Here[]; conn: number; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
+  | { type: "init"; user: string; files: FileInfo[]; main: string | null; here: Here[]; conn: number; chat: ChatMsg[]; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
   | { type: "text"; file: string; text: string; rev: number; prov?: ProvPayload | null }
   /** Revision `rev` of a file. `prov`: the typist's origin id, or the whole map after a replacement. */
   | { type: "edit"; file: string; rev: number; op: (number | string)[]; changes: Edit[]; user: string; prov: number | ProvPayload; client: string | null; seq: number }
   | { type: "ack"; file: string; rev: number; seq: number }
   | { type: "caught"; file: string; rev: number }
   | { type: "here"; here: Here[] }
+  | { type: "chat"; msg: ChatMsg }
+  | { type: "chat-error"; message: string }
   | { type: "prov"; file: string; prov: ProvPayload }
   | { type: "resynced"; file: string; rev: number | null; prov: ProvPayload | null }
   | { type: "branch"; branch: string; files: FileInfo[]; main: string | null }
@@ -67,7 +74,10 @@ export type ClientMsg =
   | { type: "open"; file: string; rev?: number }
   | { type: "edit"; file: string; rev: number; op: (number | string)[]; client: string; seq: number }
   | { type: "resync"; file: string; text: string; hash: number }
-  | { type: "viewing"; file: string | null }
+  | { type: "viewing"; file: string | null; line?: number; column?: number }
+  | { type: "chat"; text: string; anchor?: ChatAnchor }
+  | { type: "chat-resolve"; id: number; resolved: boolean }
+  | { type: "chat-delete"; id: number }
   | { type: "ai"; action: "run"; prompt: string; context: Context; session?: number; provider?: "claude" | "codex"; model?: string; effort?: string }
   | { type: "ai"; action: "apply"; session: number; files: ApplyFile[] }
   | { type: "ai"; action: "discard" | "cancel"; session: number };

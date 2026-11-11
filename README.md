@@ -59,9 +59,21 @@ page catches up from the server's log of recent revisions (the last 2000 per
 file); if the log no longer reaches back, its unsent text wins. Text is
 written to disk one second after the last change and always before a compile.
 
-**Who is here.** The header shows everyone else with the project open and the
-file they are on (click to go there); the project list shows who has each
-project open.
+**Who is here.** Everyone gets a colour (a hash of the login, the same on
+every page). The header shows everyone else with the project open as a chip
+in their colour with the file and line they are on — click it to go there —
+and their cursors show in the text with their name. The project list shows
+who has each project open.
+
+**Chat and comments.** The 💬 chat tab beside the PDF is the project's chat
+(`src/chat.rs`, kept in `.kloverleaf/chat.json`, never in the paper's files).
+A message can be pinned to a point in the paper: ⌘⌥M (or 📍 at cursor) pins it
+to the cursor's line; 💬 comment above the PDF, then a click on the page, pins
+it to that spot. A pinned comment shows as a coloured mark in the editor's
+gutter and as a pin in the PDF's margin (placed with SyncTeX, so it follows
+the text from build to build); clicking either opens it in the chat. Anchors
+keep their line's text and find it again after edits move it. Anyone may
+resolve a comment (its pin goes away); authors may delete their own messages.
 
 **Compiling.** Typing pauses for 250ms → latexmk (`-pdf`, or `-xelatex` /
 `-lualatex` from a `% !TEX program =` comment) in `.kloverleaf/out` with

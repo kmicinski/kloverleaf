@@ -30,7 +30,16 @@ the working notes for changing the code. **Keep both in sync with reality.**
   gap and ignores out-of-order revisions until `caught`. Presence (`here`) is
   per connection: set on connect, `viewing`, and removed on disconnect.
   Pages from before this change get an `init.lock` their old code reads as
-  "someone holds the lock: reload".
+  "someone holds the lock: reload". `viewing` carries the cursor (line,
+  column), throttled to 300ms by the page; colours are client-side only
+  (`web/src/people.ts`).
+- **Comments are chat messages with an anchor** (`chat.rs`): `{file, line,
+  quote, pdf?}`. The server never moves anchors; the page re-finds `quote`
+  near `line` (`chat.ts: locate`) and places PDF pins by forward SyncTeX
+  (the stored PDF click wins while the line has not moved). Nothing about a
+  comment ever goes into the project's files. Every new browser module must
+  be added to `pages::STATIC` (a test checks — a missing one once took the
+  editor page down).
 - **History never rewinds.** `heads` only move forward; a restore is a new
   entry with `meta.restores`. Snapshot policy is inside `Store::record` —
   changing it changes replay cost, not correctness. Project-level notes

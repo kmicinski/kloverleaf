@@ -21,7 +21,9 @@
 //! GET    /api/projects/{p}/history/{id}?file=       → {entry, text, at}  (text of `file` as of that entry)
 //! GET    /api/projects/{p}/history/{id}/pdf         → the project compiled as it was then
 //! POST   /api/projects/{p}/history/{id}/restore     → 204   (new entry; history never rewinds)
-//! GET    /api/projects/{p}/here                     → [{id, user, file}]  (open editor pages)
+//! GET    /api/projects/{p}/here                     → [{id, user, file, line, column}]  (open editor pages)
+//! GET    /api/projects/{p}/chat?n                   → [messages]  (the project chat, oldest first)
+//! POST   /api/projects/{p}/chat        ← {text, anchor?: {file, line, quote?}} → message
 //! GET    /api/projects/{p}/commits?n                → [{sha, ts, author, message}]
 //! POST   /api/projects/{p}/commit      ← {message}  → {sha} | null
 //! POST   /api/projects/{p}/ai          ← {prompt, context?} → {session, text, files, model, …}  (synchronous)
@@ -496,6 +498,22 @@ pub async fn restore(State(app): State<Shared>, Path((p, id)): Path<(String, i64
     p.replace(&entry.file, text, 0, &user, "restore", json!({"restores": id}))
         .map_err(bad(StatusCode::BAD_REQUEST))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_chat(State(app): State<Shared>, Path(p): Path<String>, Query(q): Query<Count>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(project(&app, &p)?.chat_recent(q.n.unwrap_or(200)))))
+}
+
+#[derive(Deserialize)]
+pub struct ChatPost {
+    text: String,
+    anchor: Option<crate::chat::Anchor>,
+}
+
+pub async fn post_chat(State(app): State<Shared>, Path(p): Path<String>, headers: HeaderMap, Json(body): Json<ChatPost>) -> ApiResult<Json<Value>> {
+    let p = project(&app, &p)?;
+    let m = p.chat_post(&user(&app, &headers), &body.text, body.anchor).map_err(bad(StatusCode::BAD_REQUEST))?;
+    Ok(Json(json!(m)))
 }
 
 pub async fn get_here(State(app): State<Shared>, Path(p): Path<String>) -> ApiResult<Json<Value>> {

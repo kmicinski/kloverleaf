@@ -233,6 +233,7 @@ export function toggleAi(show?: boolean): void {
   tabPdf.classList.toggle("on", !on);
   $("btn-ai").classList.toggle("on", on);
   document.body.classList.toggle("ai-open", on);
+  document.dispatchEvent(new CustomEvent("kl-pane", { detail: on ? "ai" : "pdf" }));
   if (on) { renderContext(); promptEl.focus(); }
 }
 

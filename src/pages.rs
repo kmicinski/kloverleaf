@@ -27,6 +27,8 @@ const STATIC: &[(&str, &str)] = &[
     ("diff.js", include_str!("../web/dist/diff.js")),
     ("upstream.js", include_str!("../web/dist/upstream.js")),
     ("ot.js", include_str!("../web/dist/ot.js")),
+    ("chat.js", include_str!("../web/dist/chat.js")),
+    ("people.js", include_str!("../web/dist/people.js")),
     ("editor.css", include_str!("../web/editor.css")),
 ];
 
@@ -181,11 +183,19 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
   <div id="editor-col"><div id="editor"></div><div id="errbar" hidden></div></div>
   <div id="divider"></div>
   <div id="pdf-pane">
-    <div id="pane-tabs"><button id="tab-pdf" class="tab on">pdf</button><button id="tab-ai" class="tab" title="ai (⌘⇧A)">✦ ai</button></div>
-    <div id="pdf-toolbar"><button id="pdf-sync" class="small" title="show the cursor's position in the PDF (⌥⏎)">⇢ pdf</button><span class="spacer"></span><span id="pdf-pages" class="muted"></span><button id="pdf-out" class="small">−</button><button id="pdf-in" class="small">+</button><button id="pdf-fit" class="small">fit</button></div>
+    <div id="pane-tabs"><button id="tab-pdf" class="tab on">pdf</button><button id="tab-ai" class="tab" title="ai (⌘⇧A)">✦ ai</button><button id="tab-chat" class="tab" title="chat with everyone on this project; comments pinned to the paper (⌘⌥M comments on the cursor's line)">💬 chat</button></div>
+    <div id="pdf-toolbar"><button id="pdf-sync" class="small" title="show the cursor's position in the PDF (⌥⏎)">⇢ pdf</button><button id="pdf-comment" class="small" title="comment on a spot in the PDF: click this, then the spot">💬 comment</button><span class="spacer"></span><span id="pdf-pages" class="muted"></span><button id="pdf-out" class="small">−</button><button id="pdf-in" class="small">+</button><button id="pdf-fit" class="small">fit</button></div>
     <div id="pdf-stale" hidden></div>
     <div id="pdf-scroll"><div id="pdf-pages-wrap"></div></div>
     <div id="pdf-empty" class="muted">compiling…</div>
+    <aside id="chat-panel" hidden>
+      <div id="chat-list"><div id="chat-empty" class="muted">Talk to everyone on this project here. To comment on a spot in the paper, put the cursor there and press ⌘⌥M (or 📍), or click 💬 comment above the PDF and then the spot — the comment shows as a pin on the PDF and in the editor's margin.</div></div>
+      <div id="chat-composer">
+        <div id="chat-anchor" hidden></div>
+        <textarea id="chat-text" rows="2" placeholder="Message everyone (⏎ sends, ⇧⏎ new line)"></textarea>
+        <div class="row"><button id="chat-pin-here" class="tiny" title="pin this message to the editor's cursor line (⌘⌥M)">📍 at cursor</button><button id="chat-pin-pdf" class="tiny" title="pin this message to a spot you click in the PDF">📍 on PDF</button><label class="muted"><input type="checkbox" id="chat-resolved"> resolved</label><span class="spacer"></span><button id="chat-send" class="small">send ⏎</button></div>
+      </div>
+    </aside>
     <aside id="ai-panel" hidden>
       <div id="ai-thread"><div id="ai-empty" class="muted">Ask for a change. Select text and ⌘⇧Q to point at regions.</div></div>
       <div id="ai-bar" hidden></div>

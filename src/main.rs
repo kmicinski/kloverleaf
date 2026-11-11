@@ -23,6 +23,7 @@ mod ai;
 mod api;
 mod auth;
 mod build;
+mod chat;
 mod gitd;
 mod history;
 mod live;
@@ -217,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{p}/history/{id}/restore", post(api::restore))
         .route("/projects/{p}/history/{id}/pdf", get(api::history_pdf))
         .route("/projects/{p}/here", get(api::get_here))
+        .route("/projects/{p}/chat", get(api::get_chat).post(api::post_chat))
         .route("/projects/{p}/commits", get(api::commits))
         .route("/projects/{p}/commit", post(api::commit))
         .route("/projects/{p}/ai", post(api::ai_run))

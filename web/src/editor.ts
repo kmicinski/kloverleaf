@@ -16,6 +16,8 @@ import * as prov from "./provenance.js";
 import * as up from "./upstream.js";
 import { renderTree, type TreeData } from "./tree.js";
 import { Op, compose, transform } from "./ot.js";
+import * as chat from "./chat.js";
+import { colorOf, ensureUserStyle } from "./people.js";
 
 const MONACO = "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs";
 const EMACS = "https://cdn.jsdelivr.net/npm/monaco-emacs@0.3.0/dist/monaco-emacs";
@@ -212,10 +214,11 @@ require(["vs/editor/editor.main", "monaco-emacs"], (_monaco, emacs) => {
   action("latex.ai.toggle", "AI: Toggle the AI tab (⌘⇧A)", () => ai.toggleAi());
   action("latex.prov.claim", "Provenance: Make this mine (⌘⇧M)", () => void prov.claimSelection());
   action("latex.history", "History: Open the timeline", () => $("btn-history").click());
+  action("chat.comment", "Chat: Comment on this line (⌘⌥M)", () => chat.pinAtCursor(), [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyM]);
   action("latex.keys", "Help: Keyboard shortcuts", showKeys);
   $("btn-keys").addEventListener("click", showKeys);
   new (emacs as MonacoEmacsModule).EmacsExtension(editor).start();
-  editor.onDidChangeCursorPosition(() => { ai.renderContext(); renderOutline(); });
+  editor.onDidChangeCursorPosition(() => { ai.renderContext(); renderOutline(); tellWhere(); });
   editor.onDidChangeModelContent(() => { renderOutline(); renderWordCount(); });
   editor.onDidChangeModel(() => renderWordCount());
   editor.onMouseUp((e) => { if (e.target.position && !e.event.rightButton) void forwardSync(true); });
@@ -230,6 +233,16 @@ require(["vs/editor/editor.main", "monaco-emacs"], (_monaco, emacs) => {
     model: (file) => models.get(file),
     fileOf: (m) => { for (const [f, mm] of models) if (mm === m) return f; return undefined; },
     travelTo: (entry) => void travelTo(entry),
+    status,
+  });
+  chat.initChat({
+    send,
+    editor: () => editor,
+    current: () => current,
+    model: (file) => models.get(file),
+    open: (file, line) => open(file, line),
+    forward: async (file, line) => (await api<SyncBox[]>(`/sync/forward?file=${encodeURIComponent(file)}&line=${line}&col=1`)).map((b) => ({ page: b.page, x: b.h, y: b.v - b.height })),
+    setPins: (pins) => pdf.setPins(pins),
     status,
   });
   ai.initAi({
@@ -353,8 +366,8 @@ function open(file: string, line?: number, column?: number, focus = true): void 
   if (!m) { pendingOpen = { file, line }; send({ type: "open", file }); return; }
   if (travel) leaveTravel();
   if (editor.getModel() !== m) editor.setModel(m);
-  if (current !== file) send({ type: "viewing", file });
   current = file;
+  tellWhere();
   prov.refresh();
   void up.fileShown(file);
   renderFiles();
@@ -627,7 +640,8 @@ function handle(m: ServerMsg): void {
       if (m.build) built(m.build, true); else if (m.building) buildEl.textContent = "compiling…";
       // Catch up every model this page already has (after a reconnect), then open the main file.
       for (const file of models.keys()) { const st = syncs.get(file); if (st) st.catching = false; catchUp(file); }
-      if (current) send({ type: "viewing", file: current });
+      chat.setMessages(m.chat ?? []);
+      tellWhere(true);
       if (!current) open(main ?? files.find((f) => f.text)?.path ?? "");
       status("synced");
       break;
@@ -665,6 +679,12 @@ function handle(m: ServerMsg): void {
     }
     case "here":
       setHere(m.here);
+      break;
+    case "chat":
+      chat.chatEvent(m.msg);
+      break;
+    case "chat-error":
+      status(`chat: ${m.message}`);
       break;
     case "branch":
       // Every text is new on the other branch: reload what this page has open.
@@ -728,6 +748,7 @@ function setFiles(list: FileInfo[], mainFile: string | null): void {
 const pdf = new PdfViewer($("pdf-scroll"), (page, x, y, jump) => void inverseSync(page, x, y, jump), (n, zoom) => {
   $("pdf-pages").textContent = `${n} page${n === 1 ? "" : "s"} · ${Math.round(zoom * 100)}%`;
 });
+pdf.onPin = (id) => chat.pinClicked(id);
 $("pdf-in").addEventListener("click", () => pdf.zoom(1.2));
 $("pdf-out").addEventListener("click", () => pdf.zoom(1 / 1.2));
 $("pdf-fit").addEventListener("click", () => pdf.zoom("fit"));
@@ -873,7 +894,7 @@ function built(b: Build, initial: boolean): void {
   renderFiles();
   if ((b.pdf || initial) && b.hasPdf) {
     $("pdf-empty").hidden = true;
-    void pdf.load(`/project/${project}/pdf?v=${b.version}`);
+    void pdf.load(`/project/${project}/pdf?v=${b.version}`).then(() => chat.pdfChanged(b.version));
   } else if (!b.hasPdf) {
     $("pdf-empty").hidden = false;
     $("pdf-empty").textContent = errors ? "no PDF: fix the error under the editor" : "no PDF yet";
@@ -990,6 +1011,7 @@ async function forwardSync(quiet = false): Promise<void> {
 async function inverseSync(page: number, x: number, y: number, jump: boolean): Promise<void> {
   try {
     const pos = await api<{ file: string; line: number; column: number } | null>(`/sync/inverse?page=${page}&x=${x.toFixed(2)}&y=${y.toFixed(2)}`);
+    if (chat.pdfArmed()) { chat.pdfComment(page, x, y, pos?.file, pos?.line); return; }
     ai.setPdfClick({ page, x, y, file: pos?.file, line: pos?.line });
     // A click puts you on that word in the source, ready to type (jump = double-click, same thing).
     if (pos) open(pos.file, pos.line, pos.column > 0 ? pos.column : undefined, true);
@@ -999,30 +1021,69 @@ async function inverseSync(page: number, x: number, y: number, jump: boolean): P
 
 // ---- who is here --------------------------------------------------------------
 
-/** Everyone with the project open (other than this page), one chip per person
- *  with the file they are on; click to go there. */
+/** Everyone with the project open (other than this page): one chip per
+ *  person in their colour, saying where they are; click to go there. Their
+ *  cursors show in the text in the same colour, with their name. */
 function setHere(list: Here[]): void {
   here = list;
   const el = $("here");
-  const people = new Map<string, Set<string>>();
+  const people = new Map<string, Here[]>();
   for (const h of here) {
     if (h.id === conn) continue;
-    const files = people.get(h.user) ?? new Set<string>();
-    if (h.file) files.add(h.file);
-    people.set(h.user, files);
+    people.set(h.user, [...(people.get(h.user) ?? []), h]);
   }
   el.replaceChildren();
-  if (!people.size) { el.textContent = "only you here"; el.classList.add("muted"); return; }
-  el.classList.remove("muted");
-  for (const [user, files] of people) {
+  if (!people.size) { el.textContent = "only you here"; el.classList.add("muted"); }
+  else el.classList.remove("muted");
+  for (const [user, pages] of people) {
+    // The page that says most about where they are: one with a file and a line.
+    const at = pages.find((h) => h.file && h.line) ?? pages.find((h) => h.file) ?? pages[0];
     const chip = document.createElement("button");
     chip.className = "small here-chip";
-    const list = [...files];
-    chip.textContent = `● ${user === me ? "you (another tab)" : user}${list.length ? ` · ${list.join(", ")}` : ""}`;
-    chip.title = list.length ? `${user} is on ${list.join(", ")} — click to open it` : `${user} has the project open`;
-    if (list.length) chip.addEventListener("click", () => open(list[0]));
+    chip.style.setProperty("--who", colorOf(user));
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const where = at.file ? ` · ${at.file}${at.line ? `:${at.line}` : ""}` : "";
+    chip.append(dot, `${user === me ? "you (another tab)" : user}${where}`);
+    chip.title = at.file ? `${user} is at ${at.file}${at.line ? ` line ${at.line}` : ""} — click to go there` : `${user} has the project open`;
+    if (at.file) chip.addEventListener("click", () => open(at.file!, at.line ?? undefined, at.column ?? undefined));
     el.appendChild(chip);
   }
+  renderCursors();
+}
+
+let cursorDecos: monaco.editor.IEditorDecorationsCollection | undefined;
+/** Other people's cursors in the file shown here. */
+function renderCursors(): void {
+  if (!editor) return;
+  cursorDecos ??= editor.createDecorationsCollection();
+  const m = editor.getModel();
+  const decos: monaco.editor.IModelDeltaDecoration[] = [];
+  for (const h of here) {
+    if (h.id === conn || !m || h.file !== current || !h.line) continue;
+    const line = Math.min(h.line, m.getLineCount());
+    const col = Math.min(h.column ?? 1, m.getLineMaxColumn(line));
+    const cls = ensureUserStyle(h.user);
+    decos.push({
+      range: new monaco.Range(line, col, line, col),
+      options: { beforeContentClassName: `rc-caret ${cls}`, hoverMessage: { value: h.user }, stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges },
+    });
+  }
+  cursorDecos.set(decos);
+}
+
+let whereTimer: number | undefined;
+let lastWhere = "";
+/** Tells the server where this page's cursor is (for everyone's `here`), at most every 300ms. */
+function tellWhere(force = false): void {
+  window.clearTimeout(whereTimer);
+  whereTimer = window.setTimeout(() => {
+    const pos = editor?.getPosition();
+    const msg = { type: "viewing" as const, file: current, line: pos?.lineNumber, column: pos?.column };
+    const key = JSON.stringify(msg);
+    if (!force && key === lastWhere) return;
+    if (send(msg)) lastWhere = key;
+  }, force ? 0 : 300);
 }
 
 // ---- files ------------------------------------------------------------------

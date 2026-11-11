@@ -19,7 +19,8 @@
 //!                                          transformed); `changes` is `op` as Monaco edits
 //!   {"type":"ack","file","rev","seq"}      your op `seq` became revision `rev`
 //!   {"type":"caught","file","rev"}         the end of the `edit`s answering `open` with `rev`
-//!   {"type":"here","here":[{id,user,file}]} who has the project open, and on which file
+//!   {"type":"here","here":[{id,user,file,line,column}]} who has the project open, and where
+//!   {"type":"chat","msg"}                  a chat message, new or changed (resolved, deleted)
 //!   {"type":"saved","file","error"?}       the write to disk finished
 //!   {"type":"building"}                    latexmk started
 //!   {"type":"built","version","ok","diags","ms","pdf"}
@@ -34,7 +35,9 @@
 //!   {"type":"edit","file","rev","op","client","seq"}
 //!                                          an ot.js op (see `ot.rs`) against revision `rev`
 //!   {"type":"resync","file","text","hash"} unsent work the log can no longer place: ours wins
-//!   {"type":"viewing","file"}              the file this page shows (for `here`)
+//!   {"type":"viewing","file","line"?,"column"?}  where this page's cursor is (for `here`)
+//!   {"type":"chat","text","anchor"?}       post to the project's chat (`chat.rs`); an anchor pins it
+//!   {"type":"chat-resolve","id","resolved"} / {"type":"chat-delete","id"}
 //!   {"type":"ai", …}                       see `ai`
 //! ```
 //!
@@ -93,6 +96,8 @@ pub struct Here {
     pub id: u64,
     pub user: String,
     pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
 }
 
 pub struct BuildOutcome {
@@ -126,6 +131,7 @@ pub enum Event {
     Building,
     Built(Arc<BuildOutcome>),
     Here(Vec<Here>),
+    Chat(crate::chat::Msg),
     Files { files: Vec<FileInfo>, main: Option<String> },
     Committed { sha: String, message: String },
     /// The project moved to another branch: every text is new, reopen everything.
@@ -161,6 +167,7 @@ pub struct Inner {
     docs: Mutex<BTreeMap<String, DocState>>,
     pub history: Store,
     here: Mutex<BTreeMap<u64, Here>>,
+    chat: Mutex<crate::chat::Chat>,
     tx: broadcast::Sender<Arc<Event>>,
     build_tx: mpsc::UnboundedSender<BuildReq>,
     latest: Mutex<Option<Arc<BuildOutcome>>>,
@@ -207,6 +214,7 @@ impl Project {
             }
         }
         let main = project::main_file(&dir, &files);
+        let chat = crate::chat::Chat::open(&dir.join(project::PRIVATE_DIR));
         let (build_tx, build_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             name: name.into(),
@@ -214,6 +222,7 @@ impl Project {
             docs: Mutex::new(docs),
             history,
             here: Mutex::new(BTreeMap::new()),
+            chat: Mutex::new(chat),
             tx: broadcast::channel(256).0,
             build_tx,
             latest: Mutex::new(None),
@@ -326,6 +335,30 @@ impl Project {
         u.sort();
         u.dedup();
         u
+    }
+
+    // ---- chat ------------------------------------------------------------------
+
+    pub fn chat_recent(&self, n: usize) -> Vec<crate::chat::Msg> {
+        self.chat.lock().unwrap().recent(n)
+    }
+
+    pub fn chat_post(&self, user: &str, text: &str, anchor: Option<crate::chat::Anchor>) -> anyhow::Result<crate::chat::Msg> {
+        let m = self.chat.lock().unwrap().post(user, text, anchor)?;
+        self.emit(Event::Chat(m.clone()));
+        Ok(m)
+    }
+
+    pub fn chat_resolve(&self, id: u64, user: &str, resolved: bool) -> anyhow::Result<()> {
+        let m = self.chat.lock().unwrap().resolve(id, user, resolved)?;
+        self.emit(Event::Chat(m));
+        Ok(())
+    }
+
+    pub fn chat_delete(&self, id: u64, user: &str) -> anyhow::Result<()> {
+        let m = self.chat.lock().unwrap().delete(id, user)?;
+        self.emit(Event::Chat(m));
+        Ok(())
     }
 
     fn set_here(&self, id: u64, h: Option<Here>) {
@@ -909,7 +942,12 @@ enum ClientMsg {
     /// server's copy — through `replace`, so provenance is rebased and the
     /// history records it.
     Resync { file: String, text: String, hash: u32 },
-    Viewing { file: Option<String> },
+    Viewing { file: Option<String>, line: Option<u32>, column: Option<u32> },
+    Chat { text: String, anchor: Option<crate::chat::Anchor> },
+    #[serde(rename = "chat-resolve")]
+    ChatResolve { id: u64, resolved: bool },
+    #[serde(rename = "chat-delete")]
+    ChatDelete { id: u64 },
     /// Older pages ping; nothing to keep alive any more.
     Ping,
     Ai(Value),
@@ -948,10 +986,11 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut rx = p.subscribe();
     let (mut sink, mut stream) = socket.split();
-    p.set_here(id, Some(Here { id, user: user.clone(), file: None }));
+    p.set_here(id, Some(Here { id, user: user.clone(), file: None, line: None, column: None }));
     let sent = sink
         .send(msg(json!({
             "type": "init", "user": user, "files": p.files(), "main": p.main(), "here": p.here(), "conn": id,
+            "chat": p.chat_recent(500),
             "build": p.latest().map(|b| b.summary()), "building": p.building.load(Ordering::Relaxed),
             "ai": app.ai.describe(),
             "origin": p.human_origin(&user),
@@ -1005,7 +1044,22 @@ async fn serve(sink: &mut Sink, stream: &mut Stream, rx: &mut broadcast::Receive
                             Err(e) => sink.send(msg(json!({"type": "refused", "file": file, "reason": e.to_string()}))).await?,
                         }
                     }
-                    Ok(ClientMsg::Viewing { file }) => p.set_here(id, Some(Here { id, user: user.clone(), file })),
+                    Ok(ClientMsg::Viewing { file, line, column }) => p.set_here(id, Some(Here { id, user: user.clone(), file, line, column })),
+                    Ok(ClientMsg::Chat { text, anchor }) => {
+                        if let Err(e) = p.chat_post(&user, &text, anchor) {
+                            sink.send(msg(json!({"type": "chat-error", "message": e.to_string()}))).await?;
+                        }
+                    }
+                    Ok(ClientMsg::ChatResolve { id: m, resolved }) => {
+                        if let Err(e) = p.chat_resolve(m, &user, resolved) {
+                            sink.send(msg(json!({"type": "chat-error", "message": e.to_string()}))).await?;
+                        }
+                    }
+                    Ok(ClientMsg::ChatDelete { id: m }) => {
+                        if let Err(e) = p.chat_delete(m, &user) {
+                            sink.send(msg(json!({"type": "chat-error", "message": e.to_string()}))).await?;
+                        }
+                    }
                     Ok(ClientMsg::Ping) => {}
                     Ok(ClientMsg::Ai(v)) => crate::ai::handle(app.clone(), p.clone(), user.clone(), id, v),
                     Err(_) => {}
@@ -1029,6 +1083,7 @@ async fn serve(sink: &mut Sink, stream: &mut Stream, rx: &mut broadcast::Receive
                         Event::Building => json!({"type": "building"}),
                         Event::Built(b) => { let mut v = b.summary(); v["type"] = "built".into(); v }
                         Event::Here(h) => json!({"type": "here", "here": h}),
+                        Event::Chat(m) => json!({"type": "chat", "msg": m}),
                         Event::Files { files, main } => json!({"type": "files", "files": files, "main": main}),
                         Event::Committed { sha, message } => json!({"type": "committed", "sha": sha, "message": message}),
                         Event::Branch { name } => json!({"type": "branch", "branch": name, "files": p.files(), "main": p.main()}),
@@ -1131,7 +1186,7 @@ mod tests {
         assert_eq!(p.edit("main.tex", 999, op(&[], 19), "k", 3, 1, "kris"), Err("desync"));
         assert!(p.edit("main.tex", r2 + 2, op(&[(0, 0, "x")], 3), "k", 3, 1, "kris").is_err());
         assert!(p.here().is_empty());
-        p.set_here(7, Some(Here { id: 7, user: "tom".into(), file: Some("main.tex".into()) }));
+        p.set_here(7, Some(Here { id: 7, user: "tom".into(), file: Some("main.tex".into()), line: Some(3), column: Some(1) }));
         assert_eq!(p.here_users(), vec!["tom".to_string()]);
         // history has it all
         let head = p.history.head("main.tex").unwrap();

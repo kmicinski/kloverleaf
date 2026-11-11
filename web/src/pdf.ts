@@ -33,6 +33,9 @@ export class PdfViewer {
   private observer: IntersectionObserver;
   private visible = new Set<number>();
   private readonly wrap: HTMLElement;
+  private pins: { id: number; page: number; x: number; y: number; color: string; title: string }[] = [];
+  /** A comment pin was clicked (see chat.ts). */
+  onPin: (id: number) => void = () => {};
 
   constructor(
     private readonly scroller: HTMLElement,
@@ -116,6 +119,7 @@ export class PdfViewer {
       slot.el.style.height = `${vp.height}px`;
     }
     this.onPages(doc.numPages, this.scale);
+    this.drawPins();
     for (const i of this.visible) void this.render(i);
   }
 
@@ -148,7 +152,8 @@ export class PdfViewer {
   }
 
   private click(e: MouseEvent, i: number, jump: boolean): void {
-    if ((e.target as HTMLElement).classList.contains("sync-box")) return;
+    const t = e.target as HTMLElement;
+    if (t.classList.contains("sync-box") || t.closest(".chat-pin")) return;
     const r = this.pages[i].el.getBoundingClientRect();
     const x = (e.clientX - r.left) / this.scale;
     const y = (e.clientY - r.top) / this.scale;
@@ -159,6 +164,41 @@ export class PdfViewer {
     if (factor === "fit") this.fit = true;
     else { this.fit = false; this.scale = Math.min(6, Math.max(0.2, this.scale * factor)); }
     if (this.doc) void this.relayout();
+  }
+
+  /** Comment pins (PDF points, top-left origin): drawn now and after every relayout. */
+  setPins(pins: { id: number; page: number; x: number; y: number; color: string; title: string }[]): void {
+    this.pins = pins;
+    this.drawPins();
+  }
+
+  private drawPins(): void {
+    for (const el of this.wrap.querySelectorAll(".chat-pin, .chat-tick")) el.remove();
+    // Margin pins on nearby lines stack downwards instead of overlapping.
+    const bottom = new Map<number, number>();
+    for (const p of [...this.pins].sort((a, b) => a.page - b.page || a.y - b.y)) {
+      const slot = this.pages[p.page - 1];
+      if (!slot) continue;
+      // In the page's right margin at the comment's height (the text stays
+      // readable), with a short tick at the exact spot.
+      const top = Math.max(p.y * this.scale, (bottom.get(p.page) ?? -Infinity) + 24);
+      bottom.set(p.page, top);
+      const el = document.createElement("button");
+      el.className = "chat-pin";
+      el.style.left = `${slot.width - 30}px`;
+      el.style.top = `${top}px`;
+      const tick = document.createElement("div");
+      tick.className = "chat-tick";
+      tick.style.left = `${p.x * this.scale - 2}px`;
+      tick.style.top = `${p.y * this.scale}px`;
+      tick.style.setProperty("--who", p.color);
+      slot.el.appendChild(tick);
+      el.style.setProperty("--who", p.color);
+      el.title = p.title;
+      el.textContent = "💬";
+      el.addEventListener("click", (e) => { e.stopPropagation(); this.onPin(p.id); });
+      slot.el.appendChild(el);
+    }
   }
 
   /** Draws SyncTeX boxes and scrolls the first into view. */
