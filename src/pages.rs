@@ -32,6 +32,18 @@ const STATIC: &[(&str, &str)] = &[
     ("editor.css", include_str!("../web/editor.css")),
 ];
 
+/// A fingerprint of the browser code this server ships: the editor page
+/// carries it, the socket's `init` repeats it, and a page whose copy differs
+/// reloads itself (once its edits are sent) — so nobody keeps running old code.
+pub fn build_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let h = STATIC.iter().flat_map(|(n, b)| n.bytes().chain(b.bytes())).fold(0xcbf29ce484222325u64, |h, x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+        format!("{h:016x}")
+    })
+    .clone()
+}
+
 pub async fn static_file(Path(file): Path<String>) -> Response {
     let Some((name, body)) = STATIC.iter().find(|(name, _)| *name == file) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -157,7 +169,7 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
 <link rel="stylesheet" href="/static/editor.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
 </head>
-<body data-project="{name}" data-user="{user}" data-admin="{admin}" data-manages="{manages}">
+<body data-project="{name}" data-user="{user}" data-admin="{admin}" data-manages="{manages}" data-build="{build}">
 <header>
   <a href="/">projects</a><strong>{name}</strong>
   <span id="status" class="muted"></span>
@@ -221,6 +233,7 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
         admin = if admin { "1" } else { "0" },
         who = who_label,
         who_title = escape(&who_title),
+        build = build_id(),
     )))
 }
 

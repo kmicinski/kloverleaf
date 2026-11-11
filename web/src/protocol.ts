@@ -28,7 +28,7 @@ export interface AiProvider { id: "claude" | "codex"; label: string; models: str
 export interface AiMode { mode: "off" | "on"; reason?: string; default?: AiChoice; providers?: AiProvider[]; unavailable?: Record<string, string> }
 
 export type ServerMsg =
-  | { type: "init"; user: string; files: FileInfo[]; main: string | null; here: Here[]; conn: number; chat: ChatMsg[]; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
+  | { type: "init"; user: string; files: FileInfo[]; main: string | null; here: Here[]; conn: number; chat: ChatMsg[]; build_id?: string; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
   | { type: "text"; file: string; text: string; rev: number; prov?: ProvPayload | null }
   /** Revision `rev` of a file. `prov`: the typist's origin id, or the whole map after a replacement. */
   | { type: "edit"; file: string; rev: number; op: (number | string)[]; changes: Edit[]; user: string; prov: number | ProvPayload; client: string | null; seq: number }

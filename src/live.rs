@@ -991,6 +991,7 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
         .send(msg(json!({
             "type": "init", "user": user, "files": p.files(), "main": p.main(), "here": p.here(), "conn": id,
             "chat": p.chat_recent(500),
+            "build_id": crate::pages::build_id(),
             "build": p.latest().map(|b| b.summary()), "building": p.building.load(Ordering::Relaxed),
             "ai": app.ai.describe(),
             "origin": p.human_origin(&user),

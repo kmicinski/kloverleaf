@@ -633,6 +633,7 @@ function connect(): void {
 function handle(m: ServerMsg): void {
   switch (m.type) {
     case "init":
+      if (m.build_id && document.body.dataset.build && m.build_id !== document.body.dataset.build) { reloadWhenSafe(); }
       setFiles(m.files, m.main); conn = m.conn; setHere(m.here); ai.setMode(m.ai); prov.setMyOrigin(m.origin);
       branchName = m.branch; renderBranchChip();
       up.initUpstream({ editor: () => editor, current: () => current, open: (file, line) => open(file, line), status }, m.upstream);
@@ -1046,10 +1047,23 @@ function setHere(list: Here[]): void {
     const where = at.file ? ` · ${at.file}${at.line ? `:${at.line}` : ""}` : "";
     chip.append(dot, `${user === me ? "you (another tab)" : user}${where}`);
     chip.title = at.file ? `${user} is at ${at.file}${at.line ? ` line ${at.line}` : ""} — click to go there` : `${user} has the project open`;
-    if (at.file) chip.addEventListener("click", () => open(at.file!, at.line ?? undefined, at.column ?? undefined));
+    chip.addEventListener("click", () => {
+      if (at.file) open(at.file, at.line ?? undefined, at.column ?? undefined);
+      else status(`${user}'s page hasn't said where they are yet (it may be running an older version of kloverleaf; it updates itself shortly)`);
+    });
     el.appendChild(chip);
   }
   renderCursors();
+}
+
+/** kloverleaf was updated: reload once nothing typed here is waiting to be sent. */
+function reloadWhenSafe(): void {
+  status("kloverleaf was updated — reloading…");
+  const tryNow = () => {
+    if ([...syncs.values()].some(pending)) { window.setTimeout(tryNow, 500); return; }
+    location.reload();
+  };
+  window.setTimeout(tryNow, 300);
 }
 
 let cursorDecos: monaco.editor.IEditorDecorationsCollection | undefined;
