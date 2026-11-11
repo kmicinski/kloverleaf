@@ -11,7 +11,8 @@ export interface Diagnostic {
   file: string; line: number | null; severity: "error" | "warning" | "info"; message: string;
   column?: number; end_column?: number; hint?: string; context?: string;
 }
-export interface Lock { user: string; since: number; until: number }
+/** A page with the project open: its connection, who, and the file it shows. */
+export interface Here { id: number; user: string; file: string | null }
 /** `stale`: this compile stopped before writing a PDF; the one shown is an earlier build's. */
 export interface Build { version: number; ok: boolean; diags: Diagnostic[]; ms: number; pdf: boolean; hasPdf: boolean; stale?: boolean }
 export interface Origin { id: number; kind: string; user: string; ts: number; meta: Record<string, unknown> }
@@ -22,16 +23,19 @@ export interface AiProvider { id: "claude" | "codex"; label: string; models: str
 export interface AiMode { mode: "off" | "on"; reason?: string; default?: AiChoice; providers?: AiProvider[]; unavailable?: Record<string, string> }
 
 export type ServerMsg =
-  | { type: "init"; user: string; files: FileInfo[]; main: string | null; lock: Lock | null; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
-  | { type: "text"; file: string; text: string; prov?: ProvPayload | null }
-  | { type: "edit"; file: string; changes: Edit[]; user?: string; origin?: number }
+  | { type: "init"; user: string; files: FileInfo[]; main: string | null; here: Here[]; conn: number; build: Build | null; building: boolean; ai: AiMode; origin: number; branch: string; upstream: boolean }
+  | { type: "text"; file: string; text: string; rev: number; prov?: ProvPayload | null }
+  /** Revision `rev` of a file. `prov`: the typist's origin id, or the whole map after a replacement. */
+  | { type: "edit"; file: string; rev: number; op: (number | string)[]; changes: Edit[]; user: string; prov: number | ProvPayload; client: string | null; seq: number }
+  | { type: "ack"; file: string; rev: number; seq: number }
+  | { type: "caught"; file: string; rev: number }
+  | { type: "here"; here: Here[] }
   | { type: "prov"; file: string; prov: ProvPayload }
-  | { type: "resynced"; file: string; prov: ProvPayload | null }
+  | { type: "resynced"; file: string; rev: number | null; prov: ProvPayload | null }
   | { type: "branch"; branch: string; files: FileInfo[]; main: string | null }
   | { type: "saved"; file: string; error?: string | null }
   | { type: "building" }
   | ({ type: "built" } & Build)
-  | { type: "lock"; lock: Lock | null }
   | { type: "files"; files: FileInfo[]; main: string | null }
   | { type: "committed"; sha: string; message: string }
   | { type: "refused"; file: string; reason: string }
@@ -47,7 +51,7 @@ export interface ProposedFile { path: string; before: string; after: string; del
 export interface ApplyFile { path: string; text: string; delete?: boolean }
 
 export type AiEvent = { session?: number; user: string } & (
-  | { event: "started"; prompt: string; mode: AiMode; choice?: AiChoice }
+  | { event: "started"; prompt: string; mode: AiMode; choice?: AiChoice; by?: string }
   | { event: "phase"; text: string }
   | { event: "turn"; role: string; text: string; model: string }
   | { event: "tool"; role: string; name: string; input: Record<string, unknown>; summary: string; error?: boolean }
@@ -60,11 +64,10 @@ export type AiEvent = { session?: number; user: string } & (
 );
 
 export type ClientMsg =
-  | { type: "open"; file: string }
-  | { type: "edit"; file: string; changes: Edit[]; hash: number }
+  | { type: "open"; file: string; rev?: number }
+  | { type: "edit"; file: string; rev: number; op: (number | string)[]; client: string; seq: number }
   | { type: "resync"; file: string; text: string; hash: number }
-  | { type: "ping" }
-  | { type: "lock"; action: "take" | "steal" | "release" }
+  | { type: "viewing"; file: string | null }
   | { type: "ai"; action: "run"; prompt: string; context: Context; session?: number; provider?: "claude" | "codex"; model?: string; effort?: string }
   | { type: "ai"; action: "apply"; session: number; files: ApplyFile[] }
   | { type: "ai"; action: "discard" | "cancel"; session: number };

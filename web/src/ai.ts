@@ -94,9 +94,10 @@ export async function restore(): Promise<void> {
   const r = await api<{ threads: ThreadInfo[] }>("/ai/threads").catch(() => ({ threads: [] as ThreadInfo[] }));
   threads = r.threads;
   renderThreads();
+  // Your own open conversation; someone else's stays in the switcher, not in your face.
   const pick = session !== undefined && threads.some((t) => t.id === session)
     ? session
-    : threads.find((t) => t.status === "running" || t.status === "idle" || t.status === "interrupted")?.id;
+    : threads.find((t) => t.user === me && (t.status === "running" || t.status === "idle" || t.status === "interrupted"))?.id;
   if (pick !== undefined) await openThread(pick);
   else startFresh();
 }
@@ -106,7 +107,7 @@ function renderThreads(): void {
     const o = document.createElement("option");
     o.value = String(t.id);
     const mark = t.status === "running" ? "● " : t.status === "interrupted" ? "⚠ " : t.status === "applied" ? "✓ " : t.status === "discarded" ? "× " : "";
-    o.textContent = `${mark}${t.title.slice(0, 48)}${t.title.length > 48 ? "…" : ""} · ${when(t.updated)}`;
+    o.textContent = `${mark}${t.user !== me ? `${t.user}: ` : ""}${t.title.slice(0, 48)}${t.title.length > 48 ? "…" : ""} · ${when(t.updated)}`;
     return o;
   });
   const fresh = document.createElement("option");
@@ -155,7 +156,7 @@ async function openThread(id: number): Promise<void> {
 /** A stored event, rendered like a live one (minus running-state changes). */
 function replay(ev: AiEvent): void {
   switch (ev.event) {
-    case "started": finishRun("done"); msg("prompt", ev.prompt); run = startRun(); break;
+    case "started": finishRun("done"); msg("prompt", asked(ev.by, ev.prompt)); run = startRun(); break;
     case "turn": msg("turn", ev.text, ev.role); break;
     case "tool": toolRow(ev); break;
     case "proposal": finishRun("done"); if (ev.text) msg("turn", ev.text); break;
@@ -426,23 +427,33 @@ function finishRun(word: string): void {
   run = undefined;
 }
 
-/** Events from the socket; ones from other people's sessions are shown as a line only. */
+/** A prompt, prefixed with who asked when it was not you. */
+const asked = (by: string | undefined, prompt: string) => (by && by !== me ? `${by}: ${prompt}` : prompt);
+
+/** Events from the socket. The conversation shown here gets everything, whoever
+ *  is asking in it (`user` is the person who acted); other conversations get a line. */
 export function aiEvent(ev: AiEvent): void {
-  if (ev.user !== me) {
-    if (ev.event === "started") msg("note", `${ev.user} asked the AI: ${ev.prompt}`);
-    if (ev.event === "applied") msg("note", `${ev.user} applied AI changes to ${ev.files.join(", ")}`);
+  const shown = ev.session !== undefined && ev.session === session;
+  const adopt = ev.event === "started" && session === undefined && ev.user === me; // one I just started
+  const loose = ev.session === undefined && ev.user === me;                        // refused before it began
+  if (!shown && !adopt && !loose) {
+    if (ev.event === "started" && ev.session !== undefined && !threads.some((t) => t.id === ev.session)) {
+      threads.unshift({ id: ev.session, title: ev.prompt, user: ev.user, status: "running", choice: ev.choice ?? choice!, created: Date.now(), updated: Date.now(), messages: 1 });
+      renderThreads();
+    }
+    if (ev.user !== me && ev.event === "started") msg("note", `${ev.user} asked the AI: ${ev.prompt}`);
+    if (ev.user !== me && ev.event === "applied") msg("note", `${ev.user} applied AI changes to ${ev.files.join(", ")}`);
     return;
   }
   switch (ev.event) {
     case "started":
-      if (session !== undefined && ev.session !== session) break; // another conversation of mine (other tab)
       if (session === undefined && hasEntries()) clearThread();
       session = ev.session;
       if (ev.session !== undefined && !threads.some((t) => t.id === ev.session)) {
         threads.unshift({ id: ev.session, title: ev.prompt, user: ev.user, status: "running", choice: ev.choice ?? choice!, created: Date.now(), updated: Date.now(), messages: 1 });
         renderThreads();
       }
-      msg("prompt", ev.prompt);
+      msg("prompt", asked(ev.user, ev.prompt));
       if (ev.choice) statusEl.textContent = `${ev.choice.provider} · ${ev.choice.model} · ${ev.choice.effort}`;
       finishRun("done");
       run = startRun();

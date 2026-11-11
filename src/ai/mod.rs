@@ -259,7 +259,12 @@ pub struct Ai {
 pub struct Session {
     pub id: u64,
     pub project: Project,
+    /// Who started the conversation.
     pub user: String,
+    /// Who acted last (asked, applied): every event is stamped with them, so
+    /// a collaborator following up in someone else's conversation sees the
+    /// replies and is named as the one asking.
+    pub actor: Mutex<String>,
     pub prompt: String,
     pub ws: Workspace,
     base: BTreeMap<String, String>,
@@ -288,6 +293,7 @@ impl Session {
             id,
             project,
             user: thread.user.clone(),
+            actor: Mutex::new(thread.user.clone()),
             prompt: thread.title.clone(),
             ws,
             base,
@@ -306,7 +312,7 @@ impl Session {
     /// An AI event about this session: to every open editor of the project, and into the log.
     pub fn emit(&self, mut ev: Value) {
         ev["session"] = json!(self.id);
-        ev["user"] = json!(self.user);
+        ev["user"] = json!(*self.actor.lock().unwrap());
         self.log.lock().unwrap().record(self.id, &ev);
         if let Some(sid) = self.agent_session.lock().unwrap().clone()
             && let Some(t) = self.log.lock().unwrap().thread_mut(self.id)
@@ -629,7 +635,9 @@ impl Ai {
     /// One turn with its events — `started`, then `proposal` or `error` — so
     /// the socket panel and the synchronous API tell the same story.
     pub async fn turn(&self, s: &Session, prompt: &str, ctx: &Context, choice: Choice) -> anyhow::Result<Outcome> {
-        s.emit(json!({"event": "started", "prompt": prompt, "mode": self.describe(), "choice": choice}));
+        // `by` is kept in the log (`user` is not): who asked this turn.
+        let by = s.actor.lock().unwrap().clone();
+        s.emit(json!({"event": "started", "prompt": prompt, "mode": self.describe(), "choice": choice, "by": by}));
         let result = self.run(s, prompt, ctx, Some(choice)).await;
         match &result {
             Ok(o) => s.emit(json!({"event": "proposal", "text": o.text, "files": o.files, "model": o.model,
@@ -645,7 +653,15 @@ impl Ai {
         if let Some(c) = choice {
             let mut cur = s.choice.lock().unwrap();
             if c.provider != cur.provider {
-                anyhow::bail!("switching between {} and {} starts a new conversation — apply or discard this proposal first", cur.provider.label(), c.provider.label());
+                // The other agent cannot resume this one's conversation, but it
+                // can carry on with the same scratch copy and pending changes.
+                s.emit(json!({"event": "turn", "role": "assistant", "model": c.model,
+                              "text": format!("(switched from {} to {}: it starts without the earlier messages, on the same scratch copy and changes)", cur.provider.label(), c.provider.label())}));
+                *s.agent_session.lock().unwrap() = None;
+                if let Some(t) = s.log.lock().unwrap().thread_mut(s.id) {
+                    t.agent_session = None;
+                    t.choice = c.clone();
+                }
             }
             *cur = c;
         }
@@ -699,10 +715,13 @@ impl Ai {
         out
     }
 
-    /// Applies (possibly hand-edited) proposed files to the live project,
-    /// commits, ends the session. A `None` text deletes the file.
-    pub async fn apply(&self, s: &Session, files: Vec<(String, Option<String>)>) -> anyhow::Result<Vec<String>> {
-        anyhow::ensure!(s.project.take_lock(&s.user, false), "someone else holds the edit lock");
+    /// Applies (possibly hand-edited) proposed files to the live project on
+    /// behalf of `user`, commits, ends the session. A `None` text deletes the
+    /// file. A file someone edited since the AI read it gets a three-way merge
+    /// (the AI's base, the live text, the proposal), so their typing survives;
+    /// where both changed the same words, the reviewed proposal wins.
+    pub async fn apply(&self, s: &Session, files: Vec<(String, Option<String>)>, user: &str) -> anyhow::Result<Vec<String>> {
+        *s.actor.lock().unwrap() = user.to_string();
         let model = s.model.lock().unwrap().clone();
         let mut applied = Vec::new();
         for (path, text) in files {
@@ -710,8 +729,25 @@ impl Ai {
             // the prompt addressed; provenance hovers can travel back to it.
             let meta = json!({"session": s.id, "prompt": s.prompt, "model": model, "base": s.base_heads.get(&path)});
             match text {
-                Some(text) => s.project.replace(&path, text, 0, &s.user, "ai", meta)?,
-                None if s.project.text(&path).is_some() => s.project.delete_file(&path, &s.user)?,
+                Some(text) => {
+                    let base = s.base.get(&path).cloned().unwrap_or_default();
+                    let mut tries = 0;
+                    loop {
+                        let live = s.project.text(&path);
+                        let merged = match &live {
+                            Some(l) if *l != base && s.base.contains_key(&path) => crate::upstream::merge3(&path, &base, l, &text),
+                            _ => text.clone(),
+                        };
+                        tries += 1;
+                        if s.project.replace_if(&path, live.as_deref(), merged.clone(), 0, user, "ai", meta.clone())? || tries == 5 {
+                            if tries == 5 {
+                                s.project.replace(&path, merged, 0, user, "ai", meta.clone())?;
+                            }
+                            break;
+                        }
+                    }
+                }
+                None if s.project.text(&path).is_some() => s.project.delete_file(&path, user)?,
                 None => continue,
             }
             applied.push(path);
@@ -719,8 +755,8 @@ impl Ai {
         s.project.flush();
         let short: String = s.prompt.chars().take(60).collect::<String>().replace('\n', " ");
         let message = format!("ai: {short}{}", if s.prompt.chars().count() > 60 { "…" } else { "" });
-        if let Ok(Some(sha)) = crate::gitd::commit(&s.project.dir, &message, Some(&s.user)).await {
-            s.project.committed(&sha, &message, &s.user).await;
+        if let Ok(Some(sha)) = crate::gitd::commit(&s.project.dir, &message, Some(user)).await {
+            s.project.committed(&sha, &message, user).await;
         }
         self.end_session(&s.project.name, s.id);
         Ok(applied)
@@ -855,6 +891,7 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
                     return;
                 }
             };
+            *s.actor.lock().unwrap() = user.clone();
             let app2 = app.clone();
             let s2 = s.clone();
             let task = tokio::spawn(async move {
@@ -883,7 +920,7 @@ pub fn handle(app: crate::Shared, project: Project, user: String, _conn: u64, v:
                 })
                 .unwrap_or_default();
             tokio::spawn(async move {
-                match app.ai.apply(&s, files).await {
+                match app.ai.apply(&s, files, &user).await {
                     Ok(applied) => s.emit(json!({"event": "applied", "files": applied})),
                     Err(e) => s.emit(json!({"event": "error", "message": format!("{e:#}")})),
                 }
@@ -964,7 +1001,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
         assert!(o.files[0].after.contains("Public sentence."));
         assert!(p.text("main.tex").unwrap().contains("SECRET"), "nothing applied yet");
         let files = o.files.iter().map(|f| (f.path.clone(), Some(f.after.clone()))).collect();
-        ai.apply(&s, files).await.unwrap();
+        ai.apply(&s, files, "kris").await.unwrap();
         assert!(p.text("main.tex").unwrap().contains("Public sentence."));
         assert!(ai.session(&p.name, s.id).is_none());
         assert!(!s.ws.dir.exists(), "workspace removed");
@@ -1000,7 +1037,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
         assert!(files[0].deleted && files[0].path == "extra.tex");
         assert!(!files[1].deleted && files[1].after.contains("SECRET sentence."));
         let picks = files.iter().map(|f| (f.path.clone(), (!f.deleted).then(|| f.after.clone()))).collect();
-        ai.apply(&s, picks).await.unwrap();
+        ai.apply(&s, picks, "kris").await.unwrap();
         assert!(p.text("main.tex").unwrap().contains("SECRET sentence."));
         assert!(p.text("extra.tex").is_none() && !p.dir.join("extra.tex").exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -1021,8 +1058,13 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Replaced t
         let e = ai.run(&s, "x", &Context::default(), None).await.unwrap_err().to_string();
         assert!(e.contains("without a result"), "{e}");
         let other = Choice { provider: Provider::Codex, model: "gpt".into(), effort: "low".into() };
+        // Switching agents carries on in the same conversation, without the old resume id
+        // (here the switch is made, then fails because the test has no codex).
+        *s.agent_session.lock().unwrap() = Some("old".into());
         let e = ai.run(&s, "x", &Context::default(), Some(other)).await.unwrap_err().to_string();
-        assert!(e.contains("new conversation"), "{e}");
+        assert!(e.contains("unavailable"), "{e}");
+        assert_eq!(s.choice.lock().unwrap().provider, Provider::Codex);
+        assert!(s.agent_session.lock().unwrap().is_none());
         let off = Ai::new(Catalog { claude: Err("no CLI".into()), codex: Err("no codex".into()), default: pick.clone() }, Duration::from_secs(30), 7200);
         assert!(off.new_session(p, "kris", "x", pick).is_err());
         assert_eq!(off.describe()["mode"], "off");

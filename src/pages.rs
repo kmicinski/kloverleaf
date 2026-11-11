@@ -13,7 +13,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use std::io::Read;
 
-/// `(name, body)` of every static asset, embedded at build time.
+/// `(name, body)` of every static asset, embedded at build time. Every module
+/// in `web/src` must be here (a test checks): a missing one is a 404 that
+/// stops the editor page from loading at all.
 const STATIC: &[(&str, &str)] = &[
     ("editor.js", include_str!("../web/dist/editor.js")),
     ("provenance.js", include_str!("../web/dist/provenance.js")),
@@ -24,6 +26,7 @@ const STATIC: &[(&str, &str)] = &[
     ("latex.js", include_str!("../web/dist/latex.js")),
     ("diff.js", include_str!("../web/dist/diff.js")),
     ("upstream.js", include_str!("../web/dist/upstream.js")),
+    ("ot.js", include_str!("../web/dist/ot.js")),
     ("editor.css", include_str!("../web/editor.css")),
 ];
 
@@ -57,10 +60,8 @@ pub async fn index(State(app): State<Shared>, headers: HeaderMap) -> Html<String
         .iter()
         .filter(|(name, _)| who.as_ref().is_none_or(|w| w.may(name)))
         .map(|(name, p)| {
-            let lock = p
-                .lock()
-                .map(|l| format!(r#" <span class="muted">locked by {}</span>"#, escape(&l.user)))
-                .unwrap_or_default();
+            let here = p.here_users();
+            let lock = if here.is_empty() { String::new() } else { format!(r#" <span class="muted">open: {}</span>"#, escape(&here.join(", "))) };
             format!(
                 r#"<li><a href="/edit/{name}">{name}</a>{lock} <span class="muted right"><a href="/project/{name}/pdf" target="_blank">pdf</a> · <code>git clone {}/git/{name}.git</code></span></li>"#,
                 escape(&app.public_url)
@@ -164,7 +165,7 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
   <button id="branch-chip" class="small" title="branch — click for the list, or to fork a new one">⎇ main</button>
   <button id="upstream-chip" class="small" hidden>⇅ …</button>
   <span class="spacer"></span>
-  <span id="lock" class="muted"></span><button id="lock-btn" class="small">take lock</button>
+  <span id="here" class="here" title="who else has this project open, and the file they are on"></span>
   <button id="btn-files" class="small toggle on">files</button>
   <button id="btn-history" class="small toggle">history</button>
   <button id="btn-ai" class="small toggle">ai</button>
@@ -329,5 +330,20 @@ pub async fn git_rpc(
                 .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_browser_module_is_served() {
+        for e in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/web/src")).unwrap() {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            if let Some(stem) = name.strip_suffix(".ts").filter(|s| !s.ends_with(".d")) {
+                assert!(STATIC.iter().any(|(n, _)| *n == format!("{stem}.js")), "{stem}.js is not in STATIC");
+            }
+        }
     }
 }

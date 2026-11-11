@@ -3,7 +3,7 @@
 //! through the live project, so open editors update at once.
 //!
 //! ```text
-//! GET    /api/projects                              → [{name, main, lock}]
+//! GET    /api/projects                              → [{name, main, here}]  (here: who has it open)
 //! POST   /api/projects                 ← {name}     → {name}
 //! GET    /api/projects/{p}/files                    → [{path, size, text}]
 //! GET    /api/projects/{p}/files/{path}             → the file
@@ -21,8 +21,7 @@
 //! GET    /api/projects/{p}/history/{id}?file=       → {entry, text, at}  (text of `file` as of that entry)
 //! GET    /api/projects/{p}/history/{id}/pdf         → the project compiled as it was then
 //! POST   /api/projects/{p}/history/{id}/restore     → 204   (new entry; history never rewinds)
-//! GET    /api/projects/{p}/lock                     → lock | null
-//! POST   /api/projects/{p}/lock        ← {action}   → lock | null   (take | steal | release)
+//! GET    /api/projects/{p}/here                     → [{id, user, file}]  (open editor pages)
 //! GET    /api/projects/{p}/commits?n                → [{sha, ts, author, message}]
 //! POST   /api/projects/{p}/commit      ← {message}  → {sha} | null
 //! POST   /api/projects/{p}/ai          ← {prompt, context?} → {session, text, files, model, …}  (synchronous)
@@ -91,7 +90,7 @@ pub async fn projects(State(app): State<Shared>, headers: HeaderMap) -> Json<Val
         .unwrap()
         .iter()
         .filter(|(name, _)| who.as_ref().is_none_or(|w| w.may(name)))
-        .map(|(name, p)| json!({"name": name, "main": p.main(), "lock": p.lock()}))
+        .map(|(name, p)| json!({"name": name, "main": p.main(), "here": p.here_users()}))
         .collect();
     Json(json!(list))
 }
@@ -494,30 +493,13 @@ pub async fn restore(State(app): State<Shared>, Path((p, id)): Path<(String, i64
         .map_err(bad(StatusCode::INTERNAL_SERVER_ERROR))?
         .ok_or((StatusCode::BAD_REQUEST, "entry has no text".into()))?;
     let user = user(&app, &headers);
-    if !p.take_lock(&user, false) {
-        return Err((StatusCode::CONFLICT, "someone else holds the edit lock".into()));
-    }
     p.replace(&entry.file, text, 0, &user, "restore", json!({"restores": id}))
         .map_err(bad(StatusCode::BAD_REQUEST))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn get_lock(State(app): State<Shared>, Path(p): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(project(&app, &p)?.lock())))
-}
-
-#[derive(Deserialize)]
-pub struct LockAction {
-    action: String,
-}
-
-pub async fn post_lock(State(app): State<Shared>, Path(p): Path<String>, headers: HeaderMap, Json(body): Json<LockAction>) -> ApiResult<Json<Value>> {
-    let p = project(&app, &p)?;
-    let held = p.lock_action(&user(&app, &headers), &body.action).map_err(|e| (StatusCode::BAD_REQUEST, e.into()))?;
-    if body.action == "take" && !held {
-        return Err((StatusCode::CONFLICT, "held by someone else".into()));
-    }
-    Ok(Json(json!(p.lock())))
+pub async fn get_here(State(app): State<Shared>, Path(p): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(project(&app, &p)?.here())))
 }
 
 #[derive(Deserialize)]
@@ -594,7 +576,7 @@ pub struct FileText {
     delete: bool,
 }
 
-pub async fn ai_apply(State(app): State<Shared>, Path((p, id)): Path<(String, u64)>, body: Option<Json<ApplyBody>>) -> ApiResult<Json<Value>> {
+pub async fn ai_apply(State(app): State<Shared>, Path((p, id)): Path<(String, u64)>, headers: HeaderMap, body: Option<Json<ApplyBody>>) -> ApiResult<Json<Value>> {
     let pr = project(&app, &p)?;
     app.ai.remember(&pr);
     let s = app.ai.session(&p, id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
@@ -602,7 +584,7 @@ pub async fn ai_apply(State(app): State<Shared>, Path((p, id)): Path<(String, u6
         Some(files) => files.into_iter().map(|f| (f.path, (!f.delete).then_some(f.text))).collect(),
         None => app.ai.proposal(&s).into_iter().map(|f| (f.path, (!f.deleted).then_some(f.after))).collect(),
     };
-    let applied = app.ai.apply(&s, files).await.map_err(bad(StatusCode::CONFLICT))?;
+    let applied = app.ai.apply(&s, files, &user(&app, &headers)).await.map_err(bad(StatusCode::CONFLICT))?;
     Ok(Json(json!({"applied": applied})))
 }
 

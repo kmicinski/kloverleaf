@@ -1,10 +1,12 @@
 // The editor page: Monaco on the left, the PDF on the right, the AI panel
 // beside it. One WebSocket carries edits out and the text, forwarded edits,
-// build results, lock state and AI events in (protocol in src/live.rs).
-// This file wires the pieces: models per file, the file list, the lock, the
-// build status and markers, SyncTeX both ways, the history drawer.
+// build results, who is here and AI events in (protocol in src/live.rs).
+// This file wires the pieces: models per file and their sync with the server
+// (operational transformation, so everyone edits at once), the file list,
+// who else is here, the build status and markers, SyncTeX both ways, the
+// history drawer.
 
-import type { Build, ClientMsg, Diagnostic, FileInfo, Lock, Region, ServerMsg } from "./protocol.js";
+import type { Build, ClientMsg, Diagnostic, Edit, FileInfo, Here, Region, ServerMsg } from "./protocol.js";
 import { api, fnv1a, me, postJson, project, socketUrl, when } from "./protocol.js";
 import { knownBibKeys, knownLabels, levenshtein, registerLatex, registerLatexNavigation, setProjectFiles } from "./latex.js";
 import { PdfViewer, type SyncBox } from "./pdf.js";
@@ -13,6 +15,7 @@ import * as ai from "./ai.js";
 import * as prov from "./provenance.js";
 import * as up from "./upstream.js";
 import { renderTree, type TreeData } from "./tree.js";
+import { Op, compose, transform } from "./ot.js";
 
 const MONACO = "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs";
 const EMACS = "https://cdn.jsdelivr.net/npm/monaco-emacs@0.3.0/dist/monaco-emacs";
@@ -27,18 +30,34 @@ let current: string | null = null;          // the file in the editor
 let pendingOpen: { file: string; line?: number } | null = null;
 let files: FileInfo[] = [];
 let main: string | null = null;
-let lock: Lock | null = null;
+let here: Here[] = [];
+let conn = 0;                               // this page's connection id (for `here`)
 let lastBuild: Build | null = null;
 let branchName = "main";
 let applyingRemote = false;
 const models = new Map<string, monaco.editor.ITextModel>();
 /** Sends if the socket is up; returns whether it went. */
 const send = (m: ClientMsg): boolean => { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(m)); return true; } return false; };
-// Hash of each file's text as the server last knew it. While the socket is
-// down edits stay local and this stops moving; on reconnect a file whose
-// text no longer matches it has unsent work, which is pushed to the server
-// instead of being overwritten by the server's older copy.
-const synced = new Map<string, number>();
+// Each file's sync state, ot.js-style: the server revision the model is at,
+// the one op sent and not yet acknowledged, and the local edits made since
+// (composed into one op, sent when the ack comes). Remote revisions are
+// transformed past both before they touch the model. While the socket is
+// down edits pile up in `buffer`; on reconnect the page asks for the
+// revisions it missed (`open` with `rev`), and if the server's log no longer
+// reaches back that far, its unsent text wins (`resync`).
+interface Sync { rev: number; inflight: Op | null; seq: number; buffer: Op | null; resyncing: boolean; catching: boolean }
+const syncs = new Map<string, Sync>();
+const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+let nextSeq = 0;
+const fresh = (rev: number): Sync => ({ rev, inflight: null, seq: 0, buffer: null, resyncing: false, catching: false });
+/** Asks for the revisions after the one this page has; until `caught`, later ones are skipped (they are in the answer). */
+function catchUp(file: string): void {
+  const st = syncs.get(file);
+  if (st?.catching) return;
+  if (st) st.catching = true;
+  send({ type: "open", file, rev: st?.rev });
+}
+const pending = (st: Sync | undefined) => !!st && (!!st.inflight || !!st.buffer || st.resyncing);
 const remote = (f: () => void) => { applyingRemote = true; try { f(); } finally { applyingRemote = false; } };
 
 // ---- editor -----------------------------------------------------------------
@@ -239,40 +258,91 @@ function editorContext(): { file?: string; line?: number; column?: number; selec
   return { file: current, line: pos?.lineNumber, column: pos?.column, selection };
 }
 
-/** Creates the model for a file's text and wires its edits to the socket. */
-function model(file: string, text: string): monaco.editor.ITextModel {
+/** Creates the model for a file's text (at server revision `rev`) and wires its edits to the socket. */
+function model(file: string, text: string, rev: number): monaco.editor.ITextModel {
   let m = models.get(file);
   if (m) {
     const local = m.getValue();
+    if (pending(syncs.get(file)) && local !== text) {
+      // Work here the server could not place: ours win — it adopts this text (provenance rebased).
+      const hash = fnv1a(local);
+      if (send({ type: "resync", file, text: local, hash })) { syncs.set(file, { ...fresh(rev), resyncing: true }); status("sent the edits made while offline"); }
+      return m;
+    }
     if (local !== text) {
-      if (fnv1a(local) !== synced.get(file)) {
-        // Unsent edits here: ours win — the server adopts this text (provenance rebased).
-        const hash = fnv1a(local);
-        if (send({ type: "resync", file, text: local, hash })) { synced.set(file, hash); status("sent the edits made while offline"); }
-        return m;
-      }
       const pos = editor.getModel() === m ? editor.getPosition() : null;
       remote(() => m!.pushEditOperations([], [{ range: m!.getFullModelRange(), text }], () => null));
       if (pos) editor.setPosition(pos);
     }
-    synced.set(file, fnv1a(text));
+    syncs.set(file, fresh(rev));
     return m;
   }
   const language = /\.(tex|sty|cls|bib|tikz|ltx|dtx)$/i.test(file) ? "latex" : /\.(md)$/i.test(file) ? "markdown" : /\.json$/i.test(file) ? "json" : "plaintext";
   m = monaco.editor.createModel(text, language, monaco.Uri.parse(`kloverleaf:/${file}`));
-  synced.set(file, fnv1a(text));
+  syncs.set(file, fresh(rev));
   m.onDidChangeContent((e) => {
     if (applyingRemote) return;
-    const changes = e.changes.map((c) => ({ offset: c.rangeOffset, length: c.rangeLength, text: c.text }));
+    const changes: Edit[] = e.changes.map((c) => ({ offset: c.rangeOffset, length: c.rangeLength, text: c.text }));
     prov.applyLocal(file, changes);
     up.localEdit();
-    const hash = fnv1a(m!.getValue());
-    if (send({ type: "edit", file, changes, hash })) { synced.set(file, hash); status("editing"); }
-    else status("offline — your edits are kept here and sent when the connection returns");
+    const before = m!.getValueLength() - changes.reduce((n, c) => n + c.text.length - c.length, 0);
+    local(file, Op.fromEdits(changes, before));
   });
   models.set(file, m);
   if (lastBuild) markers(lastBuild.diags);
   return m;
+}
+
+/** A local edit: sent now, or folded into the buffer while an earlier one awaits its ack. */
+function local(file: string, op: Op): void {
+  const st = syncs.get(file);
+  if (!st) return;
+  if (st.inflight || st.resyncing) { st.buffer = st.buffer ? compose(st.buffer, op) : op; return; }
+  st.inflight = op;
+  sendInflight(file, st);
+}
+
+function sendInflight(file: string, st: Sync): void {
+  if (!st.inflight) return;
+  st.seq = ++nextSeq;
+  if (send({ type: "edit", file, rev: st.rev, op: st.inflight.toJSON(), client: clientId, seq: st.seq })) status("editing");
+  else status("offline — your edits are kept here and sent when the connection returns");
+}
+
+/** Our op `seq` became revision `rev`: send what piled up meanwhile. */
+function acked(file: string, st: Sync, rev: number): void {
+  st.rev = rev;
+  st.inflight = st.buffer;
+  st.buffer = null;
+  sendInflight(file, st);
+}
+
+/** Lost track of a file (an op that does not fit): start over from the server's text. */
+function recover(file: string): void {
+  send({ type: "open", file });
+}
+
+/** Someone else's revision (or one of ours, met while catching up). */
+function remoteRev(m: Extract<ServerMsg, { type: "edit" }>): void {
+  const mod = models.get(m.file), st = syncs.get(m.file);
+  if (!mod || !st || st.resyncing || m.rev <= st.rev) return;
+  if (m.rev !== st.rev + 1) { catchUp(m.file); return; }
+  if (st.inflight && m.client === clientId && m.seq === st.seq) { acked(m.file, st, m.rev); return; }
+  let op = Op.fromJSON(m.op);
+  try {
+    if (st.inflight) [st.inflight, op] = transform(st.inflight, op);
+    if (st.buffer) [st.buffer, op] = transform(st.buffer, op);
+    if (op.base !== mod.getValueLength()) throw new Error("length");
+  } catch { recover(m.file); return; }
+  const changes = op.toEdits();
+  const replacement = typeof m.prov !== "number" ? m.prov : null;
+  prov.applyRemote(m.file, changes, replacement ? undefined : m.prov as number, m.user);
+  remote(() => mod.applyEdits(changes.map((c) => {
+    const a = mod.getPositionAt(c.offset), b = mod.getPositionAt(c.offset + c.length);
+    return { range: new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column), text: c.text };
+  })));
+  if (replacement && !st.inflight && !st.buffer) prov.setMap(m.file, replacement);
+  st.rev = m.rev;
 }
 
 /** Shows a file in the editor, fetching its text if this page has not seen it. */
@@ -283,6 +353,7 @@ function open(file: string, line?: number, column?: number, focus = true): void 
   if (!m) { pendingOpen = { file, line }; send({ type: "open", file }); return; }
   if (travel) leaveTravel();
   if (editor.getModel() !== m) editor.setModel(m);
+  if (current !== file) send({ type: "viewing", file });
   current = file;
   prov.refresh();
   void up.fileShown(file);
@@ -546,49 +617,61 @@ function connect(): void {
   ws.onmessage = (ev) => handle(JSON.parse(ev.data) as ServerMsg);
 }
 
-setInterval(() => send({ type: "ping" }), 20_000);
-
 function handle(m: ServerMsg): void {
   switch (m.type) {
     case "init":
-      setFiles(m.files, m.main); setLock(m.lock); ai.setMode(m.ai); prov.setMyOrigin(m.origin);
+      setFiles(m.files, m.main); conn = m.conn; setHere(m.here); ai.setMode(m.ai); prov.setMyOrigin(m.origin);
       branchName = m.branch; renderBranchChip();
       up.initUpstream({ editor: () => editor, current: () => current, open: (file, line) => open(file, line), status }, m.upstream);
       void ai.restore();
       if (m.build) built(m.build, true); else if (m.building) buildEl.textContent = "compiling…";
-      // Re-sync every model this page already has (after a reconnect), then open the main file.
-      for (const file of models.keys()) send({ type: "open", file });
+      // Catch up every model this page already has (after a reconnect), then open the main file.
+      for (const file of models.keys()) { const st = syncs.get(file); if (st) st.catching = false; catchUp(file); }
+      if (current) send({ type: "viewing", file: current });
       if (!current) open(main ?? files.find((f) => f.text)?.path ?? "");
       status("synced");
       break;
     case "text": {
-      model(m.file, m.text);
+      model(m.file, m.text, m.rev);
       prov.setMap(m.file, m.prov);
       if (pendingOpen?.file === m.file) { const { file, line } = pendingOpen; pendingOpen = null; open(file, line); }
       status("synced");
       break;
     }
-    case "edit": {
-      const mod = models.get(m.file);
-      if (!mod) break;
-      prov.applyRemote(m.file, m.changes, m.origin, m.user);
-      remote(() => mod.applyEdits(m.changes.map((c) => {
-        const a = mod.getPositionAt(c.offset), b = mod.getPositionAt(c.offset + c.length);
-        return { range: new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column), text: c.text };
-      })));
-      synced.set(m.file, fnv1a(mod.getValue()));
+    case "edit":
+      remoteRev(m);
+      break;
+    case "ack": {
+      const st = syncs.get(m.file);
+      if (!st || !st.inflight || m.seq !== st.seq || m.rev <= st.rev) break;
+      // Out of order would mean we missed a revision: catch up (our op comes back as an edit).
+      if (m.rev !== st.rev + 1) { catchUp(m.file); break; }
+      acked(m.file, st, m.rev);
       break;
     }
-    case "resynced":
+    case "caught": {
+      // Caught up after a reconnect: an op of ours the server never got goes again.
+      const st = syncs.get(m.file);
+      if (st) st.catching = false;
+      if (st?.inflight) sendInflight(m.file, st);
+      break;
+    }
+    case "resynced": {
+      const st = syncs.get(m.file);
+      if (st && m.rev !== null) { st.resyncing = false; acked(m.file, st, m.rev); }
       prov.setMap(m.file, m.prov);
       status("re-synced");
+      break;
+    }
+    case "here":
+      setHere(m.here);
       break;
     case "branch":
       // Every text is new on the other branch: reload what this page has open.
       branchName = m.branch; renderBranchChip();
       setFiles(m.files, m.main);
       leaveTravel();
-      for (const f of models.keys()) { synced.delete(f); send({ type: "open", file: f }); }
+      for (const f of models.keys()) { syncs.delete(f); send({ type: "open", file: f }); }
       if (!current && main) open(main);
       status(`on branch ${m.branch}`);
       if (!history.hidden) void openHistory();
@@ -602,9 +685,6 @@ function handle(m: ServerMsg): void {
     case "built":
       built(m, false);
       break;
-    case "lock":
-      setLock(m.lock);
-      break;
     case "files":
       setFiles(m.files, m.main);
       if (!current && main) open(main);
@@ -613,12 +693,11 @@ function handle(m: ServerMsg): void {
       status(`committed ${m.sha.slice(0, 7)}`);
       break;
     case "refused":
-      status(m.reason === "locked" ? `read-only: ${lock?.user ?? "someone"} holds the lock` : `refused: ${m.reason}`);
-      // The server's text follows; a desync means ours was wrong, so let it win.
-      if (m.reason === "desync") { const mod = models.get(m.file); if (mod) synced.set(m.file, fnv1a(mod.getValue())); }
+      // The server's text follows; work it could not place comes back as a resync (see `model`).
+      status(`refused: ${m.reason}`);
       break;
     case "lagged":
-      for (const file of models.keys()) send({ type: "open", file });
+      for (const file of models.keys()) catchUp(file);
       break;
     case "ai":
       ai.aiEvent(m);
@@ -639,7 +718,7 @@ function setFiles(list: FileInfo[], mainFile: string | null): void {
   setProjectFiles(files.map((f) => f.path));
   for (const f of [...models.keys()]) {
     if (files.some((x) => x.path === f)) continue;
-    models.get(f)?.dispose(); models.delete(f); synced.delete(f);
+    models.get(f)?.dispose(); models.delete(f); syncs.delete(f);
     if (current === f) { current = null; editor.setModel(null); }
   }
 }
@@ -918,17 +997,33 @@ async function inverseSync(page: number, x: number, y: number, jump: boolean): P
   } catch (e) { status(`sync: ${(e as Error).message}`); }
 }
 
-// ---- lock -------------------------------------------------------------------
+// ---- who is here --------------------------------------------------------------
 
-const lockBtn = $<HTMLButtonElement>("lock-btn");
-function setLock(l: Lock | null): void {
-  lock = l;
-  const mine = l?.user === me;
-  $("lock").textContent = l ? (mine ? "you hold the lock" : `${l.user} holds the lock`) : "unlocked";
-  lockBtn.textContent = !l ? "take lock" : mine ? "release" : "steal";
-  editor?.updateOptions({ readOnly: !!l && !mine });
+/** Everyone with the project open (other than this page), one chip per person
+ *  with the file they are on; click to go there. */
+function setHere(list: Here[]): void {
+  here = list;
+  const el = $("here");
+  const people = new Map<string, Set<string>>();
+  for (const h of here) {
+    if (h.id === conn) continue;
+    const files = people.get(h.user) ?? new Set<string>();
+    if (h.file) files.add(h.file);
+    people.set(h.user, files);
+  }
+  el.replaceChildren();
+  if (!people.size) { el.textContent = "only you here"; el.classList.add("muted"); return; }
+  el.classList.remove("muted");
+  for (const [user, files] of people) {
+    const chip = document.createElement("button");
+    chip.className = "small here-chip";
+    const list = [...files];
+    chip.textContent = `● ${user === me ? "you (another tab)" : user}${list.length ? ` · ${list.join(", ")}` : ""}`;
+    chip.title = list.length ? `${user} is on ${list.join(", ")} — click to open it` : `${user} has the project open`;
+    if (list.length) chip.addEventListener("click", () => open(list[0]));
+    el.appendChild(chip);
+  }
 }
-lockBtn.addEventListener("click", () => send({ type: "lock", action: !lock ? "take" : lock.user === me ? "release" : "steal" }));
 
 // ---- files ------------------------------------------------------------------
 
@@ -1431,7 +1526,7 @@ function leaveTravel(): void {
   document.body.classList.remove("time-travel");
   const live = travelFile ? models.get(travelFile) : null;
   if (live) editor.setModel(live);
-  editor.updateOptions({ readOnly: !!lock && lock.user !== me });
+  editor.updateOptions({ readOnly: false });
   if (lastBuild?.hasPdf) void pdf.load(`/project/${project}/pdf?v=${lastBuild.version}`);
   status("back to now");
 }

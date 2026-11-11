@@ -1,4 +1,4 @@
-//! Live projects: the in-memory text of every file, the edit lock, the build
+//! Live projects: the in-memory text of every file, who is here, the build
 //! loop, and the WebSocket protocol the editor speaks.
 //!
 //! One [`Project`] per directory holds the authoritative text of each text
@@ -11,38 +11,46 @@
 //!
 //! ```text
 //! server → client
-//!   {"type":"init","user","files","main","lock","build","ai"}   on connect
-//!   {"type":"text","file","text"}          whole text: answer to `open`, after an external
-//!                                          replace, or when an edit was refused (desync, lock)
-//!   {"type":"edit","file","changes"}       another editor's delta, to apply locally
+//!   {"type":"init","user","files","main","here","build","ai"}   on connect
+//!   {"type":"text","file","text","rev"}    whole text at revision `rev`: answer to `open`,
+//!                                          or when an edit could not be placed
+//!   {"type":"edit","file","rev","op","changes","user","prov","client","seq"}
+//!                                          revision `rev` of the file (anyone's change, already
+//!                                          transformed); `changes` is `op` as Monaco edits
+//!   {"type":"ack","file","rev","seq"}      your op `seq` became revision `rev`
+//!   {"type":"caught","file","rev"}         the end of the `edit`s answering `open` with `rev`
+//!   {"type":"here","here":[{id,user,file}]} who has the project open, and on which file
 //!   {"type":"saved","file","error"?}       the write to disk finished
 //!   {"type":"building"}                    latexmk started
 //!   {"type":"built","version","ok","diags","ms","pdf"}
 //!                                          latexmk finished; `pdf` says whether the PDF changed
-//!   {"type":"lock","lock"}                 {user, since, until} or null
 //!   {"type":"files","files","main"}        the file list changed
 //!   {"type":"committed","sha","message"}
 //!   {"type":"refused","file","reason"}     an edit was not applied (followed by `text`)
 //!   {"type":"ai", …}                       see `ai`
 //! client → server
-//!   {"type":"open","file"}                 get the text (the connection is then an editor of it)
-//!   {"type":"edit","file","changes":[{offset,length,text}],"hash"}
-//!                                          Monaco's content changes (UTF-16 offsets, each relative
-//!                                          to the text before the batch) and an FNV-1a hash of the result
-//!   {"type":"ping"}                        keeps the lock alive while the page is open
-//!   {"type":"lock","action":"take"|"release"|"steal"}
+//!   {"type":"open","file","rev"?}          the text; with `rev`, the revisions since it as
+//!                                          `edit`s instead when the log still has them
+//!   {"type":"edit","file","rev","op","client","seq"}
+//!                                          an ot.js op (see `ot.rs`) against revision `rev`
+//!   {"type":"resync","file","text","hash"} unsent work the log can no longer place: ours wins
+//!   {"type":"viewing","file"}              the file this page shows (for `here`)
 //!   {"type":"ai", …}                       see `ai`
 //! ```
 //!
-//! The lock: whoever edits first holds it; it expires `LOCK_TTL` after the
-//! holder's last ping, and anyone may steal it. Edits by anyone else are
-//! refused and answered with the server's text.
+//! Everyone edits at once, as in Overleaf. Each file has a revision number
+//! and a log of the ops that made the recent revisions; an op sent against an
+//! older revision is transformed past the ones it missed (`ot::transform`),
+//! applied, and broadcast — to its sender as an `ack`, through the same
+//! channel, so a page always sees the revisions before its own in order. The
+//! page does the mirror image for its unacknowledged ops (`web/src/ot.ts`).
 
 use crate::build::{self, Compiled, Diagnostic};
 use crate::history::Store;
 use crate::provenance::{self, Map};
 use crate::project::{self, FileInfo};
-use crate::text::{self, Edit};
+use crate::ot::{self, Op};
+use crate::text;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -56,18 +64,35 @@ use std::{fs, io};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
-const LOCK_TTL: i64 = 90_000;
+/// Revisions kept per file for transforming late ops and catching pages up.
+const LOG_KEEP: usize = 2000;
 
-pub enum Change {
-    Delta(Vec<Edit>),
-    Text(Arc<str>),
+/// One revision of a file, as the log keeps it and the socket sends it.
+#[derive(Clone)]
+pub struct Rev {
+    pub rev: u64,
+    pub op: Op,
+    /// The page (and its op number) that sent it; `None` for tools, the AI, git.
+    pub client: Option<String>,
+    pub seq: u64,
+    pub user: String,
+    /// The typist's origin id for a keystroke, `{spans, origins}` for a replacement.
+    pub prov: Value,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Lock {
+impl Rev {
+    fn wire(&self, file: &str) -> Value {
+        json!({"type": "edit", "file": file, "rev": self.rev, "op": self.op.to_json(), "changes": self.op.to_edits(),
+               "user": self.user, "prov": self.prov, "client": self.client, "seq": self.seq})
+    }
+}
+
+/// A page with the project open.
+#[derive(Debug, Clone, Serialize)]
+pub struct Here {
+    pub id: u64,
     pub user: String,
-    pub since: i64,
-    pub until: i64,
+    pub file: Option<String>,
 }
 
 pub struct BuildOutcome {
@@ -93,14 +118,14 @@ impl BuildOutcome {
 }
 
 pub enum Event {
-    /// `prov`: for a delta, the typist's origin id; for a text, `{spans, origins}`.
-    Changed { file: String, change: Change, origin: u64, user: String, prov: Value },
+    /// A new revision of a file; `origin` is the connection that sent it (0 = none).
+    Changed { file: String, rev: Rev, origin: u64 },
     /// The provenance of a file changed without its text (a claim).
     Provenance { file: String, prov: Value },
     Saved { file: String, error: Option<String> },
     Building,
     Built(Arc<BuildOutcome>),
-    Lock(Option<Lock>),
+    Here(Vec<Here>),
     Files { files: Vec<FileInfo>, main: Option<String> },
     Committed { sha: String, message: String },
     /// The project moved to another branch: every text is new, reopen everything.
@@ -117,7 +142,10 @@ enum BuildReq {
 
 struct DocState {
     text: String,
+    /// The revision: bumped by every change, never reset while the server runs.
     version: u64,
+    /// The ops that made the last `LOG_KEEP` revisions, oldest first.
+    log: std::collections::VecDeque<Rev>,
     saved: u64,
     /// Who wrote each run of the text (see `provenance.rs`); always as long as `text`.
     prov: Map,
@@ -132,7 +160,7 @@ pub struct Inner {
     pub dir: PathBuf,
     docs: Mutex<BTreeMap<String, DocState>>,
     pub history: Store,
-    lock: Mutex<Option<Lock>>,
+    here: Mutex<BTreeMap<u64, Here>>,
     tx: broadcast::Sender<Arc<Event>>,
     build_tx: mpsc::UnboundedSender<BuildReq>,
     latest: Mutex<Option<Arc<BuildOutcome>>>,
@@ -175,7 +203,7 @@ impl Project {
         for f in files.iter().filter(|f| f.text) {
             if let Ok(text) = fs::read_to_string(dir.join(&f.path)) {
                 let prov = history.provenance(&f.path).unwrap_or_default().fitted(&text);
-                docs.insert(f.path.clone(), DocState { text, version: 0, saved: 0, prov });
+                docs.insert(f.path.clone(), DocState { text, version: 0, log: Default::default(), saved: 0, prov });
             }
         }
         let main = project::main_file(&dir, &files);
@@ -185,7 +213,7 @@ impl Project {
             dir,
             docs: Mutex::new(docs),
             history,
-            lock: Mutex::new(None),
+            here: Mutex::new(BTreeMap::new()),
             tx: broadcast::channel(256).0,
             build_tx,
             latest: Mutex::new(None),
@@ -286,100 +314,94 @@ impl Project {
         self.latest.lock().unwrap().clone()
     }
 
-    // ---- lock ----------------------------------------------------------------
+    // ---- who is here --------------------------------------------------------
 
-    pub fn lock(&self) -> Option<Lock> {
-        let mut g = self.lock.lock().unwrap();
-        if g.as_ref().is_some_and(|l| l.until < crate::history::now_ms()) {
-            *g = None;
-        }
-        g.clone()
+    pub fn here(&self) -> Vec<Here> {
+        self.here.lock().unwrap().values().cloned().collect()
     }
 
-    /// Takes the lock for `user` if it is free (or theirs, or `steal`). Returns whether they hold it.
-    pub fn take_lock(&self, user: &str, steal: bool) -> bool {
-        let before = self.lock();
-        let now = crate::history::now_ms();
-        let ok = {
-            let mut g = self.lock.lock().unwrap();
-            match g.as_mut() {
-                Some(l) if l.user == user => {
-                    l.until = now + LOCK_TTL;
-                    true
-                }
-                Some(_) if !steal => false,
-                _ => {
-                    *g = Some(Lock { user: user.into(), since: now, until: now + LOCK_TTL });
-                    true
-                }
-            }
-        };
-        let after = self.lock();
-        if ok && before.as_ref().map(|l| &l.user) != after.as_ref().map(|l| &l.user) {
-            let _ = self.history.note(user, "lock", json!({"stolen_from": before.map(|l| l.user)}));
-            self.emit(Event::Lock(after));
-        }
-        ok
+    /// The people with the project open, each once.
+    pub fn here_users(&self) -> Vec<String> {
+        let mut u: Vec<String> = self.here.lock().unwrap().values().map(|h| h.user.clone()).collect();
+        u.sort();
+        u.dedup();
+        u
     }
 
-    pub fn release_lock(&self, user: &str) {
-        let mut g = self.lock.lock().unwrap();
-        if g.as_ref().is_some_and(|l| l.user == user) {
-            *g = None;
-            drop(g);
-            self.emit(Event::Lock(None));
-        }
-    }
-
-    /// `take` | `steal` | `release`, as the socket and the API spell it.
-    /// `Ok(held)` says whether `user` holds the lock afterwards.
-    pub fn lock_action(&self, user: &str, action: &str) -> Result<bool, &'static str> {
-        match action {
-            "take" => Ok(self.take_lock(user, false)),
-            "steal" => Ok(self.take_lock(user, true)),
-            "release" => {
-                self.release_lock(user);
-                Ok(false)
-            }
-            _ => Err("action: take | steal | release"),
-        }
-    }
-
-    /// Renews the lock if `user` holds it (the editor pings while open).
-    pub fn renew_lock(&self, user: &str) {
-        let mut g = self.lock.lock().unwrap();
-        if let Some(l) = g.as_mut()
-            && l.user == user
+    fn set_here(&self, id: u64, h: Option<Here>) {
         {
-            l.until = crate::history::now_ms() + LOCK_TTL;
+            let mut g = self.here.lock().unwrap();
+            match h {
+                Some(h) => g.insert(id, h),
+                None => g.remove(&id),
+            };
         }
+        self.emit(Event::Here(self.here()));
     }
 
     // ---- editing -------------------------------------------------------------
 
-    /// Applies an editor's delta on behalf of `user`. `Err(reason)` when the
-    /// hash does not match (the client's text was not the server's) or
-    /// someone else holds the lock; nothing changes then.
-    pub fn edit(&self, file: &str, changes: &[Edit], hash: u32, origin: u64, user: &str) -> Result<(), &'static str> {
-        if !self.take_lock(user, false) {
-            return Err("locked");
-        }
+    /// Applies a page's op, made against revision `base`, on behalf of
+    /// `user`: transformed past the revisions it missed, applied, logged,
+    /// broadcast. Returns the new revision. `Err(reason)` when it cannot be
+    /// placed (a revision the log no longer has, or an op for another text);
+    /// nothing changes then.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit(&self, file: &str, base: u64, op: Op, client: &str, seq: u64, origin: u64, user: &str) -> Result<u64, &'static str> {
         let mut docs = self.docs.lock().unwrap();
         let Some(doc) = docs.get_mut(file) else { return Err("no such file") };
-        let next = text::apply(&doc.text, changes);
-        if text::fnv1a(&next) != hash {
+        if base > doc.version {
             return Err("desync");
         }
-        doc.text = next;
+        let missed = (doc.version - base) as usize;
+        if missed > doc.log.len() {
+            return Err("desync");
+        }
+        let mut op = op;
+        for r in doc.log.iter().skip(doc.log.len() - missed) {
+            op = ot::transform(&op, &r.op)?.0;
+        }
+        if op.base != doc.text.encode_utf16().count() {
+            return Err("desync");
+        }
+        let changes = op.to_edits();
+        doc.text = text::apply(&doc.text, &changes);
         doc.version += 1;
         self.touched(user);
-        let _ = self.history.record(file, user, "delta", Some(changes), &doc.text, json!({}));
+        let _ = self.history.record(file, user, "delta", Some(&changes), &doc.text, json!({}));
         let me = self.human_origin(user);
-        doc.prov.apply(changes, me);
+        doc.prov.apply(&changes, me);
         let _ = self.history.set_provenance(file, &doc.prov);
+        let rev = Rev { rev: doc.version, op, client: Some(client.into()), seq, user: user.into(), prov: json!(me) };
+        let n = rev.rev;
+        // Broadcast under the lock: revisions must reach every page in order.
+        self.emit(Event::Changed { file: file.into(), rev: rev.clone(), origin });
+        Self::log(doc, rev);
         drop(docs);
-        self.after_change(file, Change::Delta(changes.to_vec()), origin, user, json!(me));
-        Ok(())
+        self.after_change(file);
+        Ok(n)
+    }
+
+    fn log(doc: &mut DocState, rev: Rev) {
+        doc.log.push_back(rev);
+        while doc.log.len() > LOG_KEEP {
+            doc.log.pop_front();
+        }
+    }
+
+    /// The text and its revision, or — when `since` is given and the log
+    /// still reaches back to it — the revisions after `since`.
+    pub fn catch_up(&self, file: &str, since: Option<u64>) -> Option<Result<(Vec<Value>, u64), (String, u64)>> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(file)?;
+        if let Some(since) = since
+            && since <= doc.version
+            && (doc.version - since) as usize <= doc.log.len()
+        {
+            let n = (doc.version - since) as usize;
+            return Some(Ok((doc.log.iter().skip(doc.log.len() - n).map(|r| r.wire(file)).collect(), doc.version)));
+        }
+        Some(Err((doc.text.clone(), doc.version)))
     }
 
     /// Replaces the whole text of a file (tools, the AI, restores, git),
@@ -402,7 +424,7 @@ impl Project {
             return Ok(false);
         }
         let fresh = !docs.contains_key(file);
-        let doc = docs.entry(file.to_string()).or_insert(DocState { text: String::new(), version: 0, saved: 0, prov: Map::default() });
+        let doc = docs.entry(file.to_string()).or_insert(DocState { text: String::new(), version: 0, log: Default::default(), saved: 0, prov: Map::default() });
         if !fresh && doc.text == text {
             return Ok(true);
         }
@@ -417,6 +439,8 @@ impl Project {
             None => self.human_origin(user),
         };
         let prov = doc.prov.rebase(&doc.text, &text, who);
+        // It travels as the smallest replacement, so typing elsewhere in the file survives it.
+        let op = ot::Op::diff(&doc.text, &text);
         doc.text = text;
         doc.version += 1;
         let entry = self.history.record(file, user, kind, None, &doc.text, meta).ok();
@@ -427,8 +451,9 @@ impl Project {
         }
         doc.prov = prov;
         let _ = self.history.set_provenance(file, &doc.prov);
-        let change = Change::Text(doc.text.as_str().into());
-        let prov_msg = self.prov_value(&doc.prov);
+        let rev = Rev { rev: doc.version, op, client: None, seq: 0, user: user.into(), prov: self.prov_value(&doc.prov) };
+        self.emit(Event::Changed { file: file.into(), rev: rev.clone(), origin });
+        Self::log(doc, rev);
         drop(docs);
         if fresh {
             self.save(file);
@@ -437,7 +462,7 @@ impl Project {
             }
             self.files_changed();
         }
-        self.after_change(file, change, origin, user, prov_msg);
+        self.after_change(file);
         Ok(true)
     }
 
@@ -487,6 +512,9 @@ impl Project {
     fn adopt(&self, texts: BTreeMap<String, String>, derive_from_current: bool) -> anyhow::Result<()> {
         let mut docs = self.docs.lock().unwrap();
         let old: BTreeMap<String, (String, Map)> = docs.iter().map(|(f, d)| (f.clone(), (d.text.clone(), d.prov.clone()))).collect();
+        // Revisions keep counting up across the switch (with an empty log), so
+        // a page's op against the old branch can never be placed on this one.
+        let next_rev = docs.values().map(|d| d.version).max().unwrap_or(0) + 1;
         docs.clear();
         for (file, text) in texts {
             let prov = if derive_from_current {
@@ -505,7 +533,7 @@ impl Project {
             let path = self.dir.join(&file);
             fs::create_dir_all(path.parent().unwrap())?;
             fs::write(&path, &text)?;
-            docs.insert(file, DocState { text, version: 1, saved: 1, prov });
+            docs.insert(file, DocState { text, version: next_rev, log: Default::default(), saved: next_rev, prov });
         }
         // Text files the snapshot lacks go away — but only ones the history
         // ever recorded (a file that exists outside the history, like the
@@ -531,7 +559,6 @@ impl Project {
     pub async fn branch_from(&self, from: Option<i64>, name: &str, user: &str, note: &str) -> anyhow::Result<()> {
         anyhow::ensure!(Self::valid_branch(name), "branch names: letters, digits, . _ - /");
         anyhow::ensure!(!self.history.branch_exists(name), "branch {name} already exists");
-        anyhow::ensure!(self.take_lock(user, false), "someone else holds the edit lock");
         let parent = self.branch();
         self.settle(user, "autosave before branching").await;
         // The fork point: the given entry, or the newest entry we have now.
@@ -560,7 +587,6 @@ impl Project {
         if self.branch() == name {
             return Ok(());
         }
-        anyhow::ensure!(self.take_lock(user, false), "someone else holds the edit lock");
         self.settle(user, "autosave before switching branch").await;
         let mut texts = BTreeMap::new();
         for (file, entry) in self.history.branch_files(name) {
@@ -637,8 +663,8 @@ impl Project {
         Ok(n)
     }
 
-    fn after_change(&self, file: &str, change: Change, origin: u64, user: &str, prov: Value) {
-        self.emit(Event::Changed { file: file.into(), change, origin, user: user.into(), prov });
+    /// After a revision was broadcast: compile soon, save once typing pauses.
+    fn after_change(&self, file: &str) {
         self.schedule_build();
         let (p, file) = (self.clone(), file.to_string());
         let version = self.docs.lock().unwrap().get(&file).map(|d| d.version).unwrap_or(0);
@@ -876,14 +902,16 @@ async fn build_loop(p: Project, mut rx: mpsc::UnboundedReceiver<BuildReq>) {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ClientMsg {
-    Open { file: String },
-    Edit { file: String, changes: Vec<Edit>, hash: u32 },
-    /// After a reconnect: the browser's text, which has edits the server never
-    /// saw (typed while the socket was down). Replaces the server's copy —
-    /// through `replace`, so provenance is rebased and the history records it.
+    Open { file: String, rev: Option<u64> },
+    Edit { file: String, rev: u64, op: Value, client: String, seq: u64 },
+    /// The browser's text, with edits the server never saw and can no longer
+    /// place (its log moved on, or the page was offline long). Replaces the
+    /// server's copy — through `replace`, so provenance is rebased and the
+    /// history records it.
     Resync { file: String, text: String, hash: u32 },
+    Viewing { file: Option<String> },
+    /// Older pages ping; nothing to keep alive any more.
     Ping,
-    Lock { action: String },
     Ai(Value),
 }
 
@@ -899,15 +927,19 @@ pub async fn session(socket: WebSocket, app: crate::Shared, project: Project, us
 
 type Sink = futures_util::stream::SplitSink<WebSocket, Message>;
 
-/// An edit the server would not take: say why, send its own text (so the
-/// client heals), and the lock when that was the reason.
-async fn refuse(sink: &mut Sink, p: &Project, file: &str, reason: &str) -> Result<(), axum::Error> {
-    sink.send(msg(json!({"type": "refused", "file": file, "reason": reason}))).await?;
-    if let Some(t) = p.text(file) {
-        sink.send(msg(json!({"type": "text", "file": file, "text": t, "prov": p.provenance(file)}))).await?;
-    }
-    if reason == "locked" {
-        sink.send(msg(json!({"type": "lock", "lock": p.lock()}))).await?;
+/// Sends a file's text at its revision, or the revisions since `since`.
+async fn send_text(sink: &mut Sink, p: &Project, file: &str, since: Option<u64>) -> Result<(), axum::Error> {
+    match p.catch_up(file, since) {
+        Some(Ok((revs, rev))) => {
+            for r in revs {
+                sink.send(msg(r)).await?;
+            }
+            sink.send(msg(json!({"type": "caught", "file": file, "rev": rev}))).await?;
+        }
+        Some(Err((text, rev))) => {
+            sink.send(msg(json!({"type": "text", "file": file, "text": text, "rev": rev, "prov": p.provenance(file)}))).await?;
+        }
+        None => sink.send(msg(json!({"type": "refused", "file": file, "reason": "no such file"}))).await?,
     }
     Ok(())
 }
@@ -916,18 +948,28 @@ async fn run(socket: WebSocket, app: crate::Shared, p: Project, user: String) ->
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut rx = p.subscribe();
     let (mut sink, mut stream) = socket.split();
-    sink.send(msg(json!({
-        "type": "init", "user": user, "files": p.files(), "main": p.main(), "lock": p.lock(),
-        "build": p.latest().map(|b| b.summary()), "building": p.building.load(Ordering::Relaxed),
-        "ai": app.ai.describe(),
-        "origin": p.human_origin(&user),
-        "branch": p.branch(),
-        "upstream": crate::upstream::tracked(&p.dir),
-    })))
-    .await?;
+    p.set_here(id, Some(Here { id, user: user.clone(), file: None }));
+    let sent = sink
+        .send(msg(json!({
+            "type": "init", "user": user, "files": p.files(), "main": p.main(), "here": p.here(), "conn": id,
+            "build": p.latest().map(|b| b.summary()), "building": p.building.load(Ordering::Relaxed),
+            "ai": app.ai.describe(),
+            "origin": p.human_origin(&user),
+            "branch": p.branch(),
+            "upstream": crate::upstream::tracked(&p.dir),
+            // Pages loaded before the move to concurrent editing speak the old
+            // edit format, which this server ignores: their own code reads this
+            // as "someone holds the lock", turns read-only and shows the name.
+            "lock": {"user": "kloverleaf was updated — reload this page;", "since": 0, "until": i64::MAX},
+        })))
+        .await;
     p.viewers.fetch_add(1, Ordering::Relaxed);
-    let result = serve(&mut sink, &mut stream, &mut rx, &app, &p, &user, id).await;
+    let result = match sent {
+        Ok(()) => serve(&mut sink, &mut stream, &mut rx, &app, &p, &user, id).await,
+        Err(e) => Err(e),
+    };
     p.viewers.fetch_sub(1, Ordering::Relaxed);
+    p.set_here(id, None);
     result
 }
 
@@ -942,33 +984,29 @@ async fn serve(sink: &mut Sink, stream: &mut Stream, rx: &mut broadcast::Receive
                     if matches!(m, Some(Ok(_))) { continue } else { break }
                 };
                 match serde_json::from_str::<ClientMsg>(&text) {
-                    Ok(ClientMsg::Open { file }) => match p.text(&file) {
-                        Some(t) => sink.send(msg(json!({"type": "text", "file": file, "text": t, "prov": p.provenance(&file)}))).await?,
-                        None => sink.send(msg(json!({"type": "refused", "file": file, "reason": "no such file"}))).await?,
-                    },
-                    Ok(ClientMsg::Edit { file, changes, hash }) => {
-                        if let Err(reason) = p.edit(&file, &changes, hash, id, &user) {
-                            refuse(sink, p, &file, reason).await?;
+                    Ok(ClientMsg::Open { file, rev }) => send_text(sink, p, &file, rev).await?,
+                    Ok(ClientMsg::Edit { file, rev, op, client, seq }) => {
+                        let placed = ot::Op::from_json(&op).and_then(|op| p.edit(&file, rev, op, &client, seq, id, &user));
+                        if let Err(reason) = placed {
+                            // The page heals from the text; its unplaced work comes back as a resync.
+                            sink.send(msg(json!({"type": "refused", "file": file, "reason": reason}))).await?;
+                            send_text(sink, p, &file, None).await?;
                         }
                     }
                     Ok(ClientMsg::Resync { file, text, hash }) => {
                         if text::fnv1a(&text) != hash {
                             continue; // mangled in transit; the client will ask again
                         }
-                        if !p.take_lock(&user, false) {
-                            refuse(sink, p, &file, "locked").await?;
-                            continue;
-                        }
                         match p.replace(&file, text, id, &user, "replace", json!({"source": "reconnect"})) {
-                            Ok(()) => sink.send(msg(json!({"type": "resynced", "file": file, "prov": p.provenance(&file)}))).await?,
+                            Ok(()) => {
+                                let rev = p.catch_up(&file, None).and_then(|r| r.err()).map(|(_, rev)| rev);
+                                sink.send(msg(json!({"type": "resynced", "file": file, "rev": rev, "prov": p.provenance(&file)}))).await?
+                            }
                             Err(e) => sink.send(msg(json!({"type": "refused", "file": file, "reason": e.to_string()}))).await?,
                         }
                     }
-                    Ok(ClientMsg::Ping) => p.renew_lock(&user),
-                    Ok(ClientMsg::Lock { action }) => {
-                        let _ = p.lock_action(&user, &action);
-                        sink.send(msg(json!({"type": "lock", "lock": p.lock()}))).await?;
-                    }
+                    Ok(ClientMsg::Viewing { file }) => p.set_here(id, Some(Here { id, user: user.clone(), file })),
+                    Ok(ClientMsg::Ping) => {}
                     Ok(ClientMsg::Ai(v)) => crate::ai::handle(app.clone(), p.clone(), user.clone(), id, v),
                     Err(_) => {}
                 }
@@ -976,18 +1014,21 @@ async fn serve(sink: &mut Sink, stream: &mut Stream, rx: &mut broadcast::Receive
             update = rx.recv() => match update {
                 Ok(ev) => {
                     let out = match &*ev {
-                        Event::Changed { file, change, origin, user: who, prov } => {
-                            if *origin == id { continue }
-                            match change {
-                                Change::Delta(changes) => json!({"type": "edit", "file": file, "changes": changes, "user": who, "origin": prov}),
-                                Change::Text(text) => json!({"type": "text", "file": file, "text": &**text, "prov": prov}),
+                        Event::Changed { file, rev, origin } => {
+                            if *origin == id {
+                                // Our own op: an ack, in order with the revisions before it.
+                                // (A resync's replacement is answered by `resynced` instead.)
+                                if rev.client.is_none() { continue }
+                                json!({"type": "ack", "file": file, "rev": rev.rev, "seq": rev.seq})
+                            } else {
+                                rev.wire(file)
                             }
                         }
                         Event::Provenance { file, prov } => json!({"type": "prov", "file": file, "prov": prov}),
                         Event::Saved { file, error } => json!({"type": "saved", "file": file, "error": error}),
                         Event::Building => json!({"type": "building"}),
                         Event::Built(b) => { let mut v = b.summary(); v["type"] = "built".into(); v }
-                        Event::Lock(l) => json!({"type": "lock", "lock": l}),
+                        Event::Here(h) => json!({"type": "here", "here": h}),
                         Event::Files { files, main } => json!({"type": "files", "files": files, "main": main}),
                         Event::Committed { sha, message } => json!({"type": "committed", "sha": sha, "message": message}),
                         Event::Branch { name } => json!({"type": "branch", "branch": name, "files": p.files(), "main": p.main()}),
@@ -1059,30 +1100,42 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn op(edits: &[(usize, usize, &str)], len: usize) -> Op {
+        let e: Vec<text::Edit> = edits.iter().map(|(o, l, t)| text::Edit { offset: *o, length: *l, text: (*t).into() }).collect();
+        Op::from_edits(&e, len).unwrap()
+    }
+
     #[tokio::test]
-    async fn edits_verify_and_lock() {
+    async fn concurrent_editors_both_land() {
         let root = root();
         let p = Project::create(&root, "t", Duration::from_secs(30)).await.unwrap();
         assert_eq!(p.main().as_deref(), Some("main.tex"));
         p.replace("main.tex", "hello world".into(), 0, "kris", "replace", json!({})).unwrap();
-        let changes = vec![
-            Edit { offset: 6, length: 5, text: "there".into() },
-            Edit { offset: 0, length: 5, text: "hi".into() },
-        ];
-        assert_eq!(p.edit("main.tex", &changes, 0, 1, "kris"), Err("desync"));
-        assert_eq!(p.text("main.tex").unwrap(), "hello world");
-        assert_eq!(p.edit("main.tex", &changes, text::fnv1a("hi there"), 1, "kris"), Ok(()));
+        let Some(Err((_, r0))) = p.catch_up("main.tex", None) else { panic!() };
+        // Kris and Tom both edit revision r0; Tom's arrives second and is transformed.
+        let r1 = p.edit("main.tex", r0, op(&[(6, 5, "there"), (0, 5, "hi")], 11), "k", 1, 1, "kris").unwrap();
+        assert_eq!(r1, r0 + 1);
         assert_eq!(p.text("main.tex").unwrap(), "hi there");
-        assert_eq!(p.lock().unwrap().user, "kris", "first editor takes the lock");
-        let more = vec![Edit { offset: 0, length: 0, text: "x".into() }];
-        assert_eq!(p.edit("main.tex", &more, text::fnv1a("xhi there"), 2, "someone"), Err("locked"));
-        assert!(p.take_lock("someone", true));
-        assert_eq!(p.edit("main.tex", &more, text::fnv1a("xhi there"), 2, "someone"), Ok(()));
-        p.release_lock("someone");
-        assert!(p.lock().is_none());
+        let r2 = p.edit("main.tex", r0, op(&[(11, 0, "!")], 11), "t", 1, 2, "tom").unwrap();
+        assert_eq!(p.text("main.tex").unwrap(), "hi there!");
+        // A tool replaces the text while Kris's next op is still in flight against r2.
+        p.replace("main.tex", "hi there! (ed.)".into(), 0, "ai", "replace", json!({})).unwrap();
+        p.edit("main.tex", r2, op(&[(0, 0, "Oh, ")], 9), "k", 2, 1, "kris").unwrap();
+        assert_eq!(p.text("main.tex").unwrap(), "Oh, hi there! (ed.)");
+        // A page that missed revisions is caught up with the ops, in order.
+        let Some(Ok((revs, _))) = p.catch_up("main.tex", Some(r1)) else { panic!() };
+        assert_eq!(revs.len(), 3);
+        assert_eq!(revs[0]["user"], "tom");
+        assert_eq!(revs[2]["client"], "k");
+        // Unplaceable: from the future, or for a different text.
+        assert_eq!(p.edit("main.tex", 999, op(&[], 19), "k", 3, 1, "kris"), Err("desync"));
+        assert!(p.edit("main.tex", r2 + 2, op(&[(0, 0, "x")], 3), "k", 3, 1, "kris").is_err());
+        assert!(p.here().is_empty());
+        p.set_here(7, Some(Here { id: 7, user: "tom".into(), file: Some("main.tex".into()) }));
+        assert_eq!(p.here_users(), vec!["tom".to_string()]);
         // history has it all
         let head = p.history.head("main.tex").unwrap();
-        assert_eq!(p.history.text_at(head).unwrap().unwrap(), "xhi there");
+        assert_eq!(p.history.text_at(head).unwrap().unwrap(), "Oh, hi there! (ed.)");
         // files
         p.write_file("figs/a.bin", vec![1, 2, 3], "kris").unwrap();
         assert!(p.files().iter().any(|f| f.path == "figs/a.bin" && !f.text));

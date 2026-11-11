@@ -312,3 +312,8 @@ body.ai-open #pdf-stale { visibility: hidden; }
 .track-form { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin-top: .5rem; }
 .track-form p { flex-basis: 100%; margin: .2rem 0 0; font-size: .85em; }
 #upstream-panel .up-head select { font-size: .95em; padding: .05rem .3rem; max-width: 200px; }
+
+/* who else has the project open */
+#here { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+#here .here-chip { background: #eee8d5; border-color: #d9d2bf; color: #586e75; }
+#here .here-chip::first-letter { color: #859900; }

@@ -30,6 +30,7 @@ mod members;
 mod pages;
 mod project;
 mod provenance;
+mod ot;
 mod text;
 mod upstream;
 
@@ -215,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{p}/history/{id}", get(api::history_entry))
         .route("/projects/{p}/history/{id}/restore", post(api::restore))
         .route("/projects/{p}/history/{id}/pdf", get(api::history_pdf))
-        .route("/projects/{p}/lock", get(api::get_lock).post(api::post_lock))
+        .route("/projects/{p}/here", get(api::get_here))
         .route("/projects/{p}/commits", get(api::commits))
         .route("/projects/{p}/commit", post(api::commit))
         .route("/projects/{p}/ai", post(api::ai_run))

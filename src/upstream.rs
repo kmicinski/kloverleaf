@@ -534,6 +534,22 @@ fn merge_text(path: &str, base: &str, ours: &str, theirs: &str, picks: &HashMap<
         .collect())
 }
 
+/// A three-way text merge that always produces text: conflicting runs take
+/// `theirs` (for an AI apply: the proposal the person just reviewed).
+pub fn merge3(path: &str, base: &str, ours: &str, theirs: &str) -> String {
+    let mut settled = 0;
+    match merge_text(path, base, ours, theirs, &HashMap::new(), &mut settled) {
+        Ok(t) => t,
+        Err(pieces) => pieces
+            .into_iter()
+            .map(|p| match p {
+                Piece::Same { text } => text,
+                Piece::Conflict { theirs, .. } => theirs,
+            })
+            .collect(),
+    }
+}
+
 pub fn merge_all(base: &Files, ours: &Files, theirs: &Files, picks: &HashMap<String, Pick>) -> Merged {
     let paths: BTreeSet<&String> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
     let mut files = BTreeMap::new();
@@ -1276,6 +1292,16 @@ async fn dirty(p: &Project, cfg: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge3_keeps_typing_made_while_the_ai_worked() {
+        let base = "Intro.\nSECRET sentence.\nEnd.\n";
+        let live = "Intro, typed meanwhile.\nSECRET sentence.\nEnd.\n";
+        let ai = "Intro.\nPublic sentence.\nEnd.\n";
+        assert_eq!(merge3("a.tex", base, live, ai), "Intro, typed meanwhile.\nPublic sentence.\nEnd.\n");
+        // Both changed the same words: the reviewed proposal wins.
+        assert_eq!(merge3("a.tex", "x y z\n", "x Q z\n", "x R z\n"), "x R z\n");
+    }
 
     fn files(pairs: &[(&str, &str)]) -> Files {
         pairs.iter().map(|(k, v)| (k.to_string(), v.as_bytes().to_vec())).collect()

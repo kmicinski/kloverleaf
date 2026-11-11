@@ -20,7 +20,7 @@ for the AI, the `claude` CLI (see §AI).
 ## How it fits together
 
 ```
-projects/<name>/*.tex ──▶ live.rs: Project (text of every file, the lock, the build loop)
+projects/<name>/*.tex ──▶ live.rs: Project (text of every file, who is here, the build loop)
         ▲    │                 │ debounce 250ms, flush, latexmk ──▶ .kloverleaf/out/main.pdf ──▶ browser (PDF.js, pages swapped in place)
  git push    │                 ├──▶ history.rs: every change, as a tree, in .kloverleaf/history.sqlite
         │    └── autocommit every 30s ──▶ .git ◀── /git/<name>.git (smart HTTP: clone, pull, push)
@@ -31,9 +31,9 @@ projects/<name>/*.tex ──▶ live.rs: Project (text of every file, the lock, 
 | Layer | Where | What it is |
 |---|---|---|
 | Project | `src/project.rs` | The directory layout, which files are text, main-file and engine detection (`% !TEX program`, `% !TEX root`). |
-| Live | `src/live.rs`, `web/src/editor.ts` | In-memory documents, the edit lock, the build loop, the WebSocket protocol, autosave. |
+| Live | `src/live.rs`, `web/src/editor.ts` | In-memory documents, concurrent editing (with `src/ot.rs` / `web/src/ot.ts`), who is here, the build loop, the WebSocket protocol, autosave. |
 | Build | `src/build.rs` | latexmk, the log parsed into diagnostics with file and line, SyncTeX both ways, page images and text. |
-| History | `src/history.rs` | The edit log: deltas, replacements, snapshots, git commits and lock events, in SQLite per project. |
+| History | `src/history.rs` | The edit log: deltas, replacements, snapshots, git commits and branch events, in SQLite per project. |
 | Git | `src/gitd.rs` | Repository setup, autocommit, smart HTTP by spawning `git upload-pack`/`receive-pack`. |
 | AI | `src/ai/`, `web/src/ai.ts` | The agent CLIs (`claude.rs`, `codex.rs`, what they share in `cli.rs`), the loopback MCP tools over a scratch workspace (`mcp.rs`, `tools.rs`), sessions, conversations, proposals. |
 | App | `src/main.rs`, `auth.rs`, `api.rs`, `pages.rs` | Routes, identity, the tool API, the pages. |
@@ -45,16 +45,23 @@ before the code.
 
 ### Editing
 
-The server holds the authoritative text of every text file. The editor sends
-Monaco's deltas with a hash of the result; a mismatch is refused and answered
-with the full text, which heals any drift. Tools and the AI replace whole
-files through the API and every open editor updates at once. Text is written
-to disk one second after the last change and always before a compile.
+The server holds the authoritative text of every text file, and everyone
+edits at once, as in Overleaf. Each file has a revision number; the editor
+sends each change as an operation against the revision it had, and the server
+transforms it past whatever it missed (operational transformation, the ot.js
+model: `src/ot.rs`, mirrored in `web/src/ot.ts`), applies it, and broadcasts
+the new revision. The page transforms incoming revisions past its own
+unacknowledged edits the same way, so typing never waits for the network and
+two people in the same paragraph both keep their words. Tools and the AI
+replace whole files through the API; that travels as the smallest
+replacement, so typing elsewhere in the file survives it. After a reconnect a
+page catches up from the server's log of recent revisions (the last 2000 per
+file); if the log no longer reaches back, its unsent text wins. Text is
+written to disk one second after the last change and always before a compile.
 
-**The lock.** Whoever edits first holds the project's edit lock; everyone
-else's editor is read-only until the holder releases it, it expires (90s
-after their page stops pinging), or someone steals it from the header. A lock
-change is noted in the history.
+**Who is here.** The header shows everyone else with the project open and the
+file they are on (click to go there); the project list shows who has each
+project open.
 
 **Compiling.** Typing pauses for 250ms → latexmk (`-pdf`, or `-xelatex` /
 `-lualatex` from a `% !TEX program =` comment) in `.kloverleaf/out` with
@@ -256,8 +263,13 @@ binary files stay as they are — plus the CLI's own web search and fetch.
 Removed files show as *deleted* cards in the proposal. When it
 finishes you get a diff per file in an editable diff editor; apply it, edit
 it first, ask a follow-up in the same session, or discard. Applying goes
-through the live document (so it needs the lock), is recorded in the history
-with the prompt, and is committed to git.
+through the live document, is recorded in the history with the prompt, and
+is committed to git. A file someone typed into while the AI worked is merged
+three ways (what the AI read, the live text, the proposal), so their typing
+survives; where both changed the same words, the reviewed proposal wins. Any
+collaborator can follow up in anyone's conversation; the events name whoever
+asked, and switching between Claude and Codex mid-conversation carries on
+with the same scratch copy (the new agent starts without the old messages).
 
 The agent is a headless CLI run once per turn — **`claude`** (Claude Code) or
 **`codex`** (OpenAI's Codex CLI), picked per question in the panel along with
@@ -337,7 +349,7 @@ if the size matters.
 ## Developing
 
 `make test` runs the unit tests (log and SyncTeX parsing, the history store's
-replay, the lock, the git round trip, the MCP tools over a workspace, and the
+replay, concurrent editing and its transformation, the git round trip, the MCP tools over a workspace, and the
 AI turn against a stand-in `claude` script that speaks stream-json). The browser code is plain TypeScript
 compiled by `tsc` (no bundler); Monaco, monaco-emacs and PDF.js load from
 CDNs. The Rust binary embeds `web/dist/*.js`, so run `make web` after

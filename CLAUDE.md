@@ -13,14 +13,28 @@ the working notes for changing the code. **Keep both in sync with reality.**
   `reload_from_disk`, which adopts the disk as truth through `replace`.
 - **Hashes must agree.** `text::fnv1a` and `fnv1a` in `web/src/protocol.ts`
   are the same function over code points; offsets are UTF-16 (Monaco's).
-- **The lock gates browser edits and applies, not tools.** `Project::edit`
-  takes a free lock for the editing user and refuses when another holds it;
-  `ai::apply` and `restore` require it too. API `PUT`s bypass it on purpose
-  (tools are the person running them).
+- **Everyone edits at once (no lock).** Each `DocState` has a revision
+  (`version`, never reset while the server runs — a branch switch continues
+  it with an empty log) and a log of the last `LOG_KEEP` ops. `Project::edit`
+  takes an ot.js op against a revision, transforms it past the newer ones,
+  applies it. **Every revision is broadcast while the docs mutex is held** —
+  two connections once applied revs 5 and 6 and broadcast 6 first, and a page
+  that got its own ack for 6 skipped 5 forever. The sender gets its revision
+  as an `ack` through the same broadcast (never a direct send), so it sees
+  the revisions before its own in order. `replace_if` logs the smallest
+  replacement (`ot::Op::diff`) so concurrent typing survives a whole-text
+  write. `src/ot.rs` and `web/src/ot.ts` are the same algorithm; change both
+  (the browser's `transform(pending, remote)` must match the server's
+  `transform(incoming, logged)` tie-break: the first argument's insert goes
+  first). The page asks `open` with `rev` to catch up after a reconnect or a
+  gap and ignores out-of-order revisions until `caught`. Presence (`here`) is
+  per connection: set on connect, `viewing`, and removed on disconnect.
+  Pages from before this change get an `init.lock` their old code reads as
+  "someone holds the lock: reload".
 - **History never rewinds.** `heads` only move forward; a restore is a new
   entry with `meta.restores`. Snapshot policy is inside `Store::record` —
   changing it changes replay cost, not correctness. Project-level notes
-  (commits, locks) have `file = ""` and no text.
+  (commits, branches; old lock events) have `file = ""` and no text.
 - **Branches are a column, not a copy.** Every history entry carries a
   `branch`; heads and provenance are per branch (`branch_heads`,
   `branch_provenance`); `Store::lineage_of` turns a branch into
@@ -174,8 +188,8 @@ one-line summary for the activity log.
   and the tool log are the progress today (a 25-minute wall clock bounds a
   turn). The `stream_event` deltas are already parsed in `claude.rs` if that
   changes.
-- Per-keystroke presence/cursors of other people; the lock makes a single
-  writer, readers see updates live.
+- Other people's cursors and selections in the text (presence is per file
+  today, in the header).
 - Local/offline models. The old Ollama and dual-LLM providers were removed
   with the move to CLIs; a third agent CLI is a new `Provider` variant plus a
   `run()` like `ai/codex.rs`.
