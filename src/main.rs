@@ -258,6 +258,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/logout", get(auth::logout))
         .route("/invite/{token}", get(auth::invite_form).post(auth::invite_claim))
         .route("/static/{file}", get(pages::static_file))
+        .route("/favicon.svg", get(pages::favicon_svg))
+        .route("/favicon.png", get(pages::favicon_png))
+        .route("/favicon.ico", get(pages::favicon_png))
+        .route("/apple-touch-icon.png", get(pages::favicon_png))
         // The agent's loopback MCP endpoint: its own bearer token is the gate.
         .route("/mcp", post(ai::mcp::handler))
         .merge(pages)

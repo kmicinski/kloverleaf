@@ -52,11 +52,25 @@ pub async fn static_file(Path(file): Path<String>) -> Response {
     ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")], *body).into_response()
 }
 
+/// The clover in the tab: an SVG for browsers, and a PNG (rendered from
+/// the same drawing, full-bleed) for iOS home screens, Safari and `/favicon.ico`.
+const FAVICON_SVG: &str = include_str!("../web/icons/favicon.svg");
+const FAVICON_PNG: &[u8] = include_bytes!("../web/icons/apple-touch-icon.png");
+const ICON_LINKS: &str = r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="alternate icon" type="image/png" href="/favicon.png">"#;
+
+pub async fn favicon_svg() -> Response {
+    ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON_SVG).into_response()
+}
+
+pub async fn favicon_png() -> Response {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON_PNG).into_response()
+}
+
 /// The plain pages (project list, login, invitation): the stylesheet, the
 /// name, and `body`.
 pub fn shell(title: &str, body: &str) -> Html<String> {
     Html(format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>kloverleaf · {title}</title>
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>kloverleaf · {title}</title>{ICON_LINKS}
 <link rel="stylesheet" href="/static/editor.css"></head>
 <body class="page"><h1>kloverleaf</h1>{body}</body></html>"#
     ))
@@ -165,7 +179,7 @@ pub async fn editor(State(app): State<Shared>, Path(name): Path<String>, headers
         None => (escape(&user), "you".to_string()),
     };
     Ok(Html(format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>{name} · kloverleaf</title>
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>{name} · kloverleaf</title>{ICON_LINKS}
 <link rel="stylesheet" href="/static/editor.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
 </head>

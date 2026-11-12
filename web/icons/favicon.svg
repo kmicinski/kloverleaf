@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fdf6e3"/>
+      <stop offset="1" stop-color="#eee8d5"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a9bf2a"/>
+      <stop offset="1" stop-color="#6c8600"/>
+    </linearGradient>
+    <path id="h" d="M32 31C21 24 13.5 17 16.5 10.5C19 5.5 27 5 32 11.5C37 5 45 5.5 47.5 10.5C50.5 17 43 24 32 31Z"/>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)" stroke="#d9d2bd" stroke-width="2"/>
+  <path d="M30 30C37 38 42 45 52 53" fill="none" stroke="#5f7600" stroke-width="4" stroke-linecap="round"/>
+  <g transform="translate(29 29) scale(.8) translate(-32 -32)">
+    <g fill="url(#leaf)" stroke="#fdf6e3" stroke-width="2" stroke-linejoin="round">
+      <use href="#h"/>
+      <use href="#h" transform="rotate(90 32 32)"/>
+      <use href="#h" transform="rotate(180 32 32)"/>
+      <use href="#h" transform="rotate(270 32 32)"/>
+    </g>
+    <circle cx="32" cy="32" r="3.2" fill="#b58900"/>
+  </g>
+</svg>

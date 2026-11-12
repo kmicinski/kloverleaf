@@ -14,6 +14,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY web/editor.css ./web/editor.css
+COPY web/icons ./web/icons
 COPY --from=web /web/dist ./web/dist
 RUN cargo build --release
 
