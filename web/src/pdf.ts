@@ -5,6 +5,7 @@
 // report PDF coordinates (top-left origin, points) for SyncTeX; forward sync
 // draws the boxes SyncTeX returns.
 
+import { appFetch } from "./protocol.js";
 const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
 const WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 
@@ -72,7 +73,7 @@ export class PdfViewer {
     }
     const gen = ++this.generation;
     // Fetch ourselves so a server's explanation (e.g. "that version does not compile") reaches the status line.
-    const r = await fetch(url);
+    const r = await appFetch(url);
     if (!r.ok) throw new Error(await r.text());
     const data = new Uint8Array(await r.arrayBuffer());
     if (gen !== this.generation) return;

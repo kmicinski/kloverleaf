@@ -99,8 +99,21 @@ export function socketUrl(): string {
   return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/project/${project}/ws`;
 }
 
+/** fetch for our own server. When the Authelia login lapses, every request is
+ *  redirected to auth.kmicinski.com, which the browser reports only as
+ *  "Failed to fetch"; not following redirects lets us see that it happened,
+ *  say so, and tell the page (it reloads, which leads through the login). */
+export async function appFetch(url: string, init?: RequestInit): Promise<Response> {
+  const r = await fetch(url, { ...init, redirect: "manual" });
+  if (r.type === "opaqueredirect" || (r.status >= 300 && r.status < 400)) {
+    window.dispatchEvent(new CustomEvent("kl-login-expired"));
+    throw new Error("your login has expired — reload the page to sign in again");
+  }
+  return r;
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(`/api/projects/${project}${path}`, init);
+  const r = await appFetch(`/api/projects/${project}${path}`, init);
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   const ct = r.headers.get("content-type") ?? "";
   return (ct.includes("json") ? r.json() : r.text()) as Promise<T>;

@@ -1057,8 +1057,16 @@ function setHere(list: Here[]): void {
 }
 
 /** kloverleaf was updated: reload once nothing typed here is waiting to be sent. */
-function reloadWhenSafe(): void {
-  status("kloverleaf was updated — reloading…");
+// The Authelia login lapsed (see `appFetch`): once every edit has gone out
+// over the socket (which stays open), reload, which leads through the login
+// page and straight back here.
+window.addEventListener("kl-login-expired", () => reloadWhenSafe("your login expired — reloading to sign in again…"));
+
+let reloading = false;
+function reloadWhenSafe(why = "kloverleaf was updated — reloading…"): void {
+  status(why);
+  if (reloading) return;
+  reloading = true;
   const tryNow = () => {
     if ([...syncs.values()].some(pending)) { window.setTimeout(tryNow, 500); return; }
     location.reload();
